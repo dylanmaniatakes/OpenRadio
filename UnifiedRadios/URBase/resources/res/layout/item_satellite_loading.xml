@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.cardview.widget.CardView xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_margin="8dp"
+    app:cardCornerRadius="12dp"
+    app:cardElevation="4dp">
+    <LinearLayout
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="16dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+        <ProgressBar
+            android:id="@+id/loading_progress"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:indeterminateTint="#1565c0"/>
+        <LinearLayout
+            android:orientation="vertical"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="16dp">
+            <TextView
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="#333"
+                android:id="@+id/loading_message"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Loading satellite data..."/>
+            <TextView
+                android:textSize="14sp"
+                android:textColor="#666"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="�� Downloading orbital elements"/>
+        </LinearLayout>
+        <TextView
+            android:textSize="24sp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="��️"/>
+    </LinearLayout>
+</androidx.cardview.widget.CardView>

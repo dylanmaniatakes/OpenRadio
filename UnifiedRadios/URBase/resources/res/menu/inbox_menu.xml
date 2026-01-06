@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:icon="@drawable/ic_search"
+        android:id="@+id/action_search"
+        android:title="Search"
+        app:showAsAction="ifRoom"/>
+    <item
+        android:id="@+id/action_mark_all_read"
+        android:title="Mark All Read"
+        app:showAsAction="never"/>
+    <item
+        android:id="@+id/action_delete_all_read"
+        android:title="Delete All Read"
+        app:showAsAction="never"/>
+    <item
+        android:icon="@drawable/ic_send"
+        android:id="@+id/action_sent_messages"
+        android:title="Sent Messages"
+        app:showAsAction="ifRoom"/>
+    <item
+        android:id="@+id/action_refresh"
+        android:title="Refresh"
+        app:showAsAction="ifRoom"/>
+    <item
+        android:title="Filter Messages"
+        app:showAsAction="never">
+        <menu>
+            <item
+                android:id="@+id/filter_all"
+                android:title="Show All Messages"/>
+            <item
+                android:id="@+id/filter_unread"
+                android:title="Show Unread Only"/>
+            <item
+                android:id="@+id/filter_priority"
+                android:title="Show Priority Only"/>
+        </menu>
+    </item>
+    <item
+        android:id="@+id/action_settings"
+        android:title="Settings"
+        app:showAsAction="never"/>
+</menu>

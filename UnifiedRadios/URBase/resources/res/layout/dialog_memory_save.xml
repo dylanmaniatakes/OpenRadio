@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content">
+    <com.google.android.material.textfield.TextInputLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+        <EditText
+            android:id="@+id/memory_name"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Memory Name"
+            android:maxLines="1"
+            android:inputType="text"/>
+    </com.google.android.material.textfield.TextInputLayout>
+</LinearLayout>

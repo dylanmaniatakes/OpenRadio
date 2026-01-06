@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <array name="band_options">
+        <item>Narrowband</item>
+        <item>Wideband</item>
+    </array>
+    <array name="channel_mode_options">
+        <item>Direct Mode</item>
+        <item>Real-time Slot</item>
+    </array>
+    <array name="color_code_options">
+        <item>CC 0</item>
+        <item>CC 1</item>
+        <item>CC 2</item>
+        <item>CC 3</item>
+        <item>CC 4</item>
+        <item>CC 5</item>
+        <item>CC 6</item>
+        <item>CC 7</item>
+        <item>CC 8</item>
+        <item>CC 9</item>
+        <item>CC 10</item>
+        <item>CC 11</item>
+        <item>CC 12</item>
+        <item>CC 13</item>
+        <item>CC 14</item>
+        <item>CC 15</item>
+    </array>
+    <array name="color_codes">
+        <item>Color Code 1</item>
+        <item>Color Code 2</item>
+        <item>Color Code 3</item>
+        <item>Color Code 4</item>
+        <item>Color Code 5</item>
+        <item>Color Code 6</item>
+        <item>Color Code 7</item>
+        <item>Color Code 8</item>
+        <item>Color Code 9</item>
+        <item>Color Code 10</item>
+        <item>Color Code 11</item>
+        <item>Color Code 12</item>
+        <item>Color Code 13</item>
+        <item>Color Code 14</item>
+        <item>Color Code 15</item>
+    </array>
+    <array name="contact_type_options">
+        <item>Individual Call</item>
+        <item>Group Call</item>
+        <item>All Call</item>
+    </array>
+    <array name="power_options">
+        <item>Low</item>
+        <item>High</item>
+    </array>
+    <array name="time_slot_options">
+        <item>Time Slot 1</item>
+        <item>Time Slot 2</item>
+    </array>
+    <array name="timeslots">
+        <item>Timeslot 1</item>
+        <item>Timeslot 2</item>
+    </array>
+    <array name="tone_type_options">
+        <item>None</item>
+        <item>CTCSS</item>
+        <item>DCS</item>
+        <item>R-DCS</item>
+    </array>
+</resources>

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:id="@+id/itemContainer"
+    android:background="?attr/selectableItemBackground"
+    android:padding="16dp"
+    android:focusable="true"
+    android:clickable="true"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content">
+    <TextView
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="#ffffff"
+        android:gravity="center"
+        android:id="@+id/avatarText"
+        android:background="@drawable/contact_avatar_background"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:text="KC"
+        android:fontFamily="@font/roboto"
+        android:layout_marginEnd="16dp"/>
+    <LinearLayout
+        android:orientation="vertical"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1">
+        <TextView
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#ffffff"
+            android:id="@+id/callsignText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="KC5AJP"
+            android:fontFamily="@font/roboto"/>
+        <TextView
+            android:textSize="14sp"
+            android:textColor="#b0ffffff"
+            android:id="@+id/distanceText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="(186 miles West)"
+            android:fontFamily="@font/roboto"/>
+        <TextView
+            android:textSize="12sp"
+            android:textColor="#64b5f6"
+            android:id="@+id/privacyIndicator"
+            android:visibility="gone"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="�� Private location"
+            android:fontFamily="@font/roboto"/>
+    </LinearLayout>
+    <ImageView
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:src="@drawable/ic_arrow_forward"
+        app:tint="#64b5f6"/>
+</LinearLayout>

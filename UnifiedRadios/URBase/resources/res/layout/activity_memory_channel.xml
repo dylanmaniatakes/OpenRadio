@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:orientation="vertical"
+    android:background="#1c1c1e"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+    <include
+        android:id="@+id/waiting"
+        android:visibility="gone"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        layout="@layout/waiting"/>
+    <TextView
+        android:textSize="20sp"
+        android:textColor="#f3f2f2"
+        android:gravity="center"
+        android:padding="5dp"
+        android:visibility="visible"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="15dp"
+        android:text="Unified Radios"/>
+    <TextView
+        android:textColor="#ffffff"
+        android:gravity="center"
+        android:id="@+id/currentZoneText"
+        android:background="#2c2c2e"
+        android:padding="5dp"
+        android:visibility="gone"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"/>
+    <Spinner
+        android:textStyle="italic|bold"
+        android:textColor="@color/black"
+        android:gravity="center_vertical"
+        android:layout_gravity="center"
+        android:id="@+id/zoneSpinner"
+        android:background="@color/primary"
+        android:padding="8dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="16dp"
+        android:singleLine="true"
+        android:drawablePadding="8dp"
+        android:fontFamily="@font/roboto"
+        android:elevation="4dp"/>
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/channelList"
+        android:background="@color/medium_gray"
+        android:padding="8dp"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"/>
+</LinearLayout>

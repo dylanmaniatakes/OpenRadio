@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:icon="@drawable/ic_voice_mode"
+        android:id="@+id/voice_mode"
+        android:title="Voice"/>
+    <item
+        android:icon="@drawable/ic_folder"
+        android:id="@+id/text_memories"
+        android:title="Channels"/>
+    <item
+        android:icon="@drawable/ic_text_chat_mode"
+        android:id="@+id/text_chat_mode"
+        android:visibility="gone"
+        android:title="Data"/>
+</menu>
