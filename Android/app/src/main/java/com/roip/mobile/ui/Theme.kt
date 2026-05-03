@@ -1,0 +1,92 @@
+package com.roip.mobile.ui
+
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+import com.roip.mobile.data.AccentColor
+
+private val LightColors = lightColorScheme(
+    primary = Color(0xFF0E6B57),
+    onPrimary = Color(0xFFFFFFFF),
+    secondary = Color(0xFF7A5C00),
+    onSecondary = Color(0xFFFFFFFF),
+    tertiary = Color(0xFF365CA8),
+    background = Color(0xFFF4F6F3),
+    surface = Color(0xFFFFFFFF),
+    surfaceVariant = Color(0xFFE5EAE3),
+    onSurface = Color(0xFF151916),
+    onSurfaceVariant = Color(0xFF505950),
+    error = Color(0xFFB3261E)
+)
+
+private val DarkColors = darkColorScheme(
+    primary = Color(0xFF66D3B2),
+    onPrimary = Color(0xFF00382B),
+    secondary = Color(0xFFE2C36B),
+    onSecondary = Color(0xFF3C2F00),
+    tertiary = Color(0xFFAFC6FF),
+    background = Color(0xFF101412),
+    surface = Color(0xFF171C19),
+    surfaceVariant = Color(0xFF2E3833),
+    onSurface = Color(0xFFE7EEE9),
+    onSurfaceVariant = Color(0xFFBFCBC3),
+    error = Color(0xFFFFB4AB)
+)
+
+private val RoipTypography = Typography(
+    headlineMedium = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.Bold,
+        fontSize = 28.sp,
+        lineHeight = 34.sp
+    ),
+    titleLarge = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 20.sp,
+        lineHeight = 26.sp
+    ),
+    bodyLarge = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontSize = 16.sp,
+        lineHeight = 24.sp
+    ),
+    bodyMedium = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontSize = 14.sp,
+        lineHeight = 20.sp
+    ),
+    labelLarge = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 14.sp
+    )
+)
+
+@Composable
+fun RoipTheme(
+    accentColor: AccentColor = AccentColor.GREEN,
+    content: @Composable () -> Unit
+) {
+    val dark = isSystemInDarkTheme()
+    val accent = Color(if (dark) accentColor.darkPrimary else accentColor.lightPrimary)
+    val colors = (if (dark) DarkColors else LightColors).copy(
+        primary = accent,
+        secondary = accent,
+        onPrimary = if (dark) Color(0xFF001F18) else Color.White,
+        onSecondary = if (dark) Color(0xFF001F18) else Color.White
+    )
+    MaterialTheme(
+        colorScheme = colors,
+        typography = RoipTypography,
+        content = content
+    )
+}

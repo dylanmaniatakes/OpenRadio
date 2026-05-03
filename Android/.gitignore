@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Gradle / Android Studio
+/.gradle/
+/.gradle-user-home/
+/build/
+/app/build/
+/local.properties
+/.idea/
+*.iml
+
+# Native build output
+/.cxx/
+/app/.cxx/
+/app/.externalNativeBuild/
+
+# Generated packages
+*.apk
+*.ap_
+*.aab
+*.aar
+*.dex
+*.class
+
+# Local backend/dev config
+/backend/.env
+/backend/node_modules/
+
+# Logs and scratch files
+*.log
+*.tmp
+*.swp
+*.swo

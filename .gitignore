@@ -1,1 +1,51 @@
-Android/
+# macOS
+.DS_Store
+
+# Android / Gradle
+/.gradle/
+/Android/.gradle/
+/Android/.gradle-user-home/
+/Android/build/
+/Android/app/build/
+/Android/local.properties
+/Android/captures/
+/Android/.externalNativeBuild/
+/Android/.cxx/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+
+# Build artifacts
+*.apk
+*.ap_
+*.aab
+*.aar
+*.dex
+*.class
+
+# Local config and secrets
+.env
+.env.*
+!/Android/.env.example
+/Android/backend/.env
+/Android/backend/node_modules/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Native/NDK output
+obj/
+libs/
+
+# Decompiled/generated UnifiedRadios dependency output
+/UnifiedRadios/URBase/resources/Android/
+/UnifiedRadios/URBase/resources/META-INF/com/
+/UnifiedRadios/URBase/sources/android/
+/UnifiedRadios/URBase/sources/com/google/android/
+/UnifiedRadios/URBase/sources/com/hoho/
+/UnifiedRadios/URBase/sources/okhttp3/internal/platform/android/
+/UnifiedRadios/URBase/sources/org/greenrobot/eventbus/android/
