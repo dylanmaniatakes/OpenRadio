@@ -46,3 +46,5 @@ Open Radio thrives on community contributions! Whether you’re fixing bugs, add
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/W7W41QWZNC)

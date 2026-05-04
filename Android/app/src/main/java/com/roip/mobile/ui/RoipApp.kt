@@ -20,9 +20,13 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -65,6 +69,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -103,6 +108,7 @@ import kotlin.math.sin
 fun RoipApp(viewModel: MainViewModel = viewModel()) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val layout = rememberAppLayoutMetrics(state)
     var settingsOpen by remember { mutableStateOf(false) }
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -137,16 +143,26 @@ fun RoipApp(viewModel: MainViewModel = viewModel()) {
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
+                    .safeDrawingPadding()
                     .background(MaterialTheme.colorScheme.background),
-                contentPadding = PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                contentPadding = PaddingValues(
+                    start = layout.outerPadding,
+                    top = layout.outerPadding + 6.dp,
+                    end = layout.outerPadding,
+                    bottom = layout.outerPadding
+                ),
+                verticalArrangement = Arrangement.spacedBy(layout.itemSpacing)
             ) {
                 item {
                     if (settingsOpen) {
-                        SettingsHeader(onBack = { settingsOpen = false })
+                        SettingsHeader(
+                            layout = layout,
+                            onBack = { settingsOpen = false }
+                        )
                     } else {
                         OperatorHeader(
                             state = state,
+                            layout = layout,
                             onModeSelected = { mode -> viewModel.updateComjot(ComjotField.MODE, mode.name) },
                             onRecallMemory = viewModel::recallMemory,
                             onSaveMemory = viewModel::saveCurrentMemory,
@@ -179,6 +195,7 @@ fun RoipApp(viewModel: MainViewModel = viewModel()) {
                     item {
                         RadioPanel(
                             state = state,
+                            layout = layout,
                             onFieldChanged = viewModel::updateComjot,
                             onProviderFieldChanged = viewModel::updateProvider,
                             onProgram = { viewModel.programComjot(context) },
@@ -232,9 +249,38 @@ fun RoipApp(viewModel: MainViewModel = viewModel()) {
     }
 }
 
+private data class AppLayoutMetrics(
+    val outerPadding: androidx.compose.ui.unit.Dp,
+    val cardPadding: androidx.compose.ui.unit.Dp,
+    val itemSpacing: androidx.compose.ui.unit.Dp,
+    val buttonHeight: androidx.compose.ui.unit.Dp,
+    val pttHeight: androidx.compose.ui.unit.Dp,
+    val compact: Boolean,
+    val phoneRoip: Boolean
+)
+
+@Composable
+private fun rememberAppLayoutMetrics(state: AppUiState): AppLayoutMetrics {
+    val configuration = LocalConfiguration.current
+    val widthDp = configuration.screenWidthDp
+    val heightDp = configuration.screenHeightDp
+    val phoneRoip = !state.radioHardwareAvailable && state.comjot.profile.mode == ComjotMode.ROIP
+    val compact = phoneRoip || widthDp < 430 || heightDp < 760
+    return AppLayoutMetrics(
+        outerPadding = if (compact) 8.dp else 12.dp,
+        cardPadding = if (compact) 10.dp else 14.dp,
+        itemSpacing = if (compact) 8.dp else 10.dp,
+        buttonHeight = if (compact) 44.dp else 52.dp,
+        pttHeight = if (compact) 76.dp else 92.dp,
+        compact = compact,
+        phoneRoip = phoneRoip
+    )
+}
+
 @Composable
 private fun OperatorHeader(
     state: AppUiState,
+    layout: AppLayoutMetrics,
     onModeSelected: (ComjotMode) -> Unit,
     onRecallMemory: (String) -> Unit,
     onSaveMemory: (String, MemoryType) -> Unit,
@@ -243,23 +289,27 @@ private fun OperatorHeader(
     var modeMenuOpen by remember { mutableStateOf(false) }
     var memoryMenuOpen by remember { mutableStateOf(false) }
     val mode = state.comjot.profile.mode
+    val modeOptions = if (state.radioHardwareAvailable) ComjotMode.entries else listOf(ComjotMode.ROIP)
     val memoriesForMode = state.memories
         .filter { it.mode == mode || it.type == defaultMemoryType(mode) }
         .sortedWith(compareBy<RadioMemory> { it.type.ordinal }.thenBy { it.name.lowercase() })
 
+    val modeLabel = if (layout.phoneRoip) "ROIP" else modeTitle(mode, state.comjot.developerMode)
+
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        horizontalArrangement = Arrangement.spacedBy(if (layout.compact) 6.dp else 10.dp)
     ) {
         Box(modifier = Modifier.weight(1f)) {
             RadioTopButton(
-                text = modeTitle(mode, state.comjot.developerMode),
+                text = modeLabel,
+                height = layout.buttonHeight,
                 modifier = Modifier.fillMaxWidth(),
                 onClick = { modeMenuOpen = true }
             )
             DropdownMenu(expanded = modeMenuOpen, onDismissRequest = { modeMenuOpen = false }) {
-                ComjotMode.entries.forEach { nextMode ->
+                modeOptions.forEach { nextMode ->
                     DropdownMenuItem(
                         text = { Text(modeTitle(nextMode, state.comjot.developerMode)) },
                         onClick = {
@@ -273,6 +323,7 @@ private fun OperatorHeader(
         Box(modifier = Modifier.weight(0.9f)) {
             RadioTopButton(
                 text = "MEM",
+                height = layout.buttonHeight,
                 modifier = Modifier.fillMaxWidth(),
                 onClick = { memoryMenuOpen = true }
             )
@@ -325,7 +376,8 @@ private fun OperatorHeader(
         }
         RadioTopButton(
             text = "☰",
-            modifier = Modifier.width(54.dp),
+            height = layout.buttonHeight,
+            modifier = Modifier.width(if (layout.compact) 48.dp else 54.dp),
             onClick = onSettingsClicked
         )
     }
@@ -334,12 +386,13 @@ private fun OperatorHeader(
 @Composable
 private fun RadioTopButton(
     text: String,
+    height: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier,
     onClick: () -> Unit = {}
 ) {
     OutlinedButton(
         onClick = onClick,
-        modifier = modifier.height(52.dp),
+        modifier = modifier.height(height),
         shape = RoundedCornerShape(8.dp),
         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
     ) {
@@ -355,6 +408,7 @@ private fun RadioTopButton(
 
 @Composable
 private fun SettingsHeader(
+    layout: AppLayoutMetrics,
     onBack: () -> Unit
 ) {
     Card(
@@ -364,7 +418,7 @@ private fun SettingsHeader(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
+                .padding(layout.cardPadding),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -394,6 +448,7 @@ private fun SettingsHeader(
 @Composable
 private fun RadioPanel(
     state: AppUiState,
+    layout: AppLayoutMetrics,
     onFieldChanged: (ComjotField, String) -> Unit,
     onProviderFieldChanged: (String, ProviderField, String) -> Unit,
     onProgram: () -> Unit,
@@ -449,8 +504,8 @@ private fun RadioPanel(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(layout.cardPadding),
+            verticalArrangement = Arrangement.spacedBy(layout.itemSpacing)
         ) {
             RadioFaceDisplay(
                 state = state,
@@ -517,6 +572,7 @@ private fun RadioPanel(
                 enabled = pttEnabled,
                 active = pttActive,
                 busy = state.isBusy || comjot.isBusy,
+                height = layout.pttHeight,
                 disabledText = when {
                     isRoip && isHotspotMode -> "Start hotspot first"
                     isRoip -> "Connect first"
@@ -561,6 +617,14 @@ private fun RadioFaceDisplay(
     val session = state.activeSession
     val isRoip = profile.mode == ComjotMode.ROIP
     val isAllStar = isRoip && provider?.type?.providerId == ALLSTAR_PROVIDER_ID
+    if (isRoip) {
+        RoipFaceDisplay(
+            state = state,
+            provider = provider,
+            isAllStar = isAllStar
+        )
+        return
+    }
     val displayTitle = if (isRoip) {
         session?.providerName ?: provider?.type?.title ?: "ROIP"
     } else {
@@ -628,14 +692,117 @@ private fun RadioFaceDisplay(
 }
 
 @Composable
+private fun RoipFaceDisplay(
+    state: AppUiState,
+    provider: ProviderProfile?,
+    isAllStar: Boolean
+) {
+    val session = state.activeSession
+    val providerName = session?.providerName ?: provider?.type?.title ?: "ROIP"
+    val server = session?.serverHost ?: provider?.serverHost ?: "No server"
+    val port = provider?.serverPort?.takeIf { it.isNotBlank() }
+    val target = when {
+        isAllStar && provider != null -> listOf(provider.stationId, provider.target)
+            .filter { it.isNotBlank() }
+            .joinToString(" -> ")
+            .ifBlank { "Nodes not set" }
+
+        session != null -> session.target
+        provider != null -> provider.target.ifBlank { "No target" }
+        else -> "No target"
+    }
+    val sessionLabel = session?.phase?.sessionPhaseLabel() ?: "Standby"
+    val operation = if (state.radioHardwareAvailable) {
+        state.roipOperationMode.title
+    } else {
+        "Phone ROIP"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f),
+                shape = RoundedCornerShape(16.dp)
+            )
+            .border(
+                width = 1.dp,
+                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.42f),
+                shape = RoundedCornerShape(16.dp)
+            )
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        IndicatorStrip(state)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = providerName,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = listOfNotNull(server, port?.let { ":$it" }).joinToString(""),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            StatusPill(sessionLabel)
+        }
+
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val compact = maxWidth < 380.dp
+            if (compact) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    DmrMetric(label = if (isAllStar) "Node path" else "Talkgroup", value = target)
+                    DmrMetric(label = "Mode", value = operation)
+                }
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    DmrMetric(
+                        label = if (isAllStar) "Node path" else "Talkgroup",
+                        value = target,
+                        modifier = Modifier.weight(1f)
+                    )
+                    DmrMetric(label = "Mode", value = operation, modifier = Modifier.weight(1f))
+                }
+            }
+        }
+
+        if (isAllStar) {
+            AllStarInfoBox(state, provider)
+        } else {
+            DmrInfoBox(state, provider)
+        }
+
+        if (!state.radioHardwareAvailable) {
+            Text(
+                text = "ROIP-only phone mode",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
 private fun IndicatorStrip(state: AppUiState) {
     val profile = state.comjot.profile
     val session = state.activeSession
     val analogMode = profile.mode == ComjotMode.FM || profile.mode == ComjotMode.SCANNER
-    Row(
+    FlowRow(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         IndicatorLight(
             label = if (state.comjot.developerMode && profile.mode == ComjotMode.SCANNER) "SDR" else profile.mode.title.uppercase(),
@@ -929,47 +1096,87 @@ private fun RadioQuickControls(
     val profile = state.comjot.profile
     val isAllStar = provider?.type?.providerId == ALLSTAR_PROVIDER_ID
     if (profile.mode == ComjotMode.ROIP) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                RoipProviderButton(
-                    providers = state.roipProviderProfiles(),
-                    selectedProvider = provider,
-                    onSelected = { onRoipProviderSelected(it.type.providerId) },
-                    modifier = Modifier.weight(1f)
-                )
-                DmrMenuButton(
-                    state = state,
-                    provider = provider,
-                    onFieldChanged = onFieldChanged,
-                    onProviderFieldChanged = onProviderFieldChanged,
-                    modifier = Modifier.weight(1f)
-                )
-                RoipOperationModeButton(
-                    selected = state.roipOperationMode,
-                    onSelected = { onRoipOperationModeChanged(it.name) },
-                    modifier = Modifier.weight(1f)
-                )
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                if (isAllStar) {
-                    DtmfMenuButton(
-                        onSend = onSendAllStarDtmf,
-                        modifier = Modifier.weight(1f)
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val compact = maxWidth < 390.dp
+            val showHotspotControls = state.radioHardwareAvailable
+            val showRfSetup = showHotspotControls && state.roipOperationMode == RoipOperationMode.HOTSPOT
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (compact) {
+                    RoipProviderButton(
+                        providers = state.roipProviderProfiles(),
+                        selectedProvider = provider,
+                        onSelected = { onRoipProviderSelected(it.type.providerId) },
+                        modifier = Modifier.fillMaxWidth()
                     )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        DmrMenuButton(
+                            state = state,
+                            provider = provider,
+                            onFieldChanged = onFieldChanged,
+                            onProviderFieldChanged = onProviderFieldChanged,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (showHotspotControls) {
+                            RoipOperationModeButton(
+                                selected = state.roipOperationMode,
+                                onSelected = { onRoipOperationModeChanged(it.name) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        RoipProviderButton(
+                            providers = state.roipProviderProfiles(),
+                            selectedProvider = provider,
+                            onSelected = { onRoipProviderSelected(it.type.providerId) },
+                            modifier = Modifier.weight(1.1f)
+                        )
+                        DmrMenuButton(
+                            state = state,
+                            provider = provider,
+                            onFieldChanged = onFieldChanged,
+                            onProviderFieldChanged = onProviderFieldChanged,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (showHotspotControls) {
+                            RoipOperationModeButton(
+                                selected = state.roipOperationMode,
+                                onSelected = { onRoipOperationModeChanged(it.name) },
+                                modifier = Modifier.weight(0.9f)
+                            )
+                        }
+                    }
                 }
-                HotspotRfMenuButton(
-                    state = state,
-                    provider = provider,
-                    onFieldChanged = onFieldChanged,
-                    onProviderFieldChanged = onProviderFieldChanged,
-                    modifier = Modifier.weight(1f)
-                )
+
+                if (isAllStar || showRfSetup) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (isAllStar) {
+                            DtmfMenuButton(
+                                onSend = onSendAllStarDtmf,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        if (showRfSetup) {
+                            HotspotRfMenuButton(
+                                state = state,
+                                provider = provider,
+                                onFieldChanged = onFieldChanged,
+                                onProviderFieldChanged = onProviderFieldChanged,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
             }
         }
         return
@@ -2066,6 +2273,7 @@ private fun HoldToTalkButton(
     enabled: Boolean,
     active: Boolean,
     busy: Boolean,
+    height: androidx.compose.ui.unit.Dp,
     disabledText: String = "Program first",
     onStart: () -> Unit,
     onEnd: () -> Unit,
@@ -2096,7 +2304,7 @@ private fun HoldToTalkButton(
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .height(92.dp)
+            .height(height)
             .pointerInput(enabled) {
                 awaitEachGesture {
                     awaitFirstDown()

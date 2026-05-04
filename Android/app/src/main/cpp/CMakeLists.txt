@@ -56,3 +56,10 @@ target_link_libraries(
     log
     m
 )
+
+target_link_options(
+    openradio_mbe
+    PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384"
+)

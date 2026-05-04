@@ -54,6 +54,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.Locale
 import java.net.URLDecoder
 import kotlin.coroutines.resume
@@ -96,6 +97,7 @@ class MainViewModel(
         val shouldMigrateHotspotSoftwareIdDefault = !prefs.getBoolean(KEY_HOTSPOT_SOFTWARE_ID_DEFAULT_MIGRATED, false)
         val shouldMigrateHotspotPackageIdDefault = !prefs.getBoolean(KEY_HOTSPOT_PACKAGE_ID_DEFAULT_MIGRATED, false)
         val shouldMigrateHotspotSlotFlagsDefault = !prefs.getBoolean(KEY_HOTSPOT_SLOT_FLAGS_DEFAULT_MIGRATED, false)
+        val radioHardwareAvailable = detectRadioHardwareAvailable()
         val loadedRadioVolume = when {
             shouldMigrateRadioVolumeDefault && (savedVolume == null || savedVolume == LEGACY_RADIO_VOLUME_DEFAULT) -> {
                 DEFAULT_RADIO_VOLUME
@@ -125,7 +127,9 @@ class MainViewModel(
                 micGain = prefs.getString(KEY_MIC_GAIN, currentProfile.micGain) ?: currentProfile.micGain,
                 repeaterDecoupling = prefs.getBoolean(KEY_REPEATER_DECOUPLING, currentProfile.repeaterDecoupling),
                 baudRate = prefs.getString(KEY_BAUD_RATE, currentProfile.baudRate) ?: currentProfile.baudRate
-            )
+            ).let { profile ->
+                if (radioHardwareAvailable) profile else profile.copy(mode = ComjotMode.ROIP)
+            }
 
             val loadedHotspot = current.hotspot.loadFromPrefs(prefs).let { hotspot ->
                 var migrated = hotspot
@@ -149,13 +153,23 @@ class MainViewModel(
                 selectedMemoryId = prefs.getString(KEY_SELECTED_MEMORY_ID, current.selectedMemoryId),
                 knobControlMode = prefs.getEnum(KEY_KNOB_CONTROL_MODE, KnobControlMode.entries, current.knobControlMode),
                 accentColor = prefs.getEnum(KEY_ACCENT_COLOR, AccentColor.entries, current.accentColor),
-                roipOperationMode = prefs.getEnum(KEY_ROIP_OPERATION_MODE, RoipOperationMode.entries, current.roipOperationMode),
+                roipOperationMode = if (radioHardwareAvailable) {
+                    prefs.getEnum(KEY_ROIP_OPERATION_MODE, RoipOperationMode.entries, current.roipOperationMode)
+                } else {
+                    RoipOperationMode.DIRECT
+                },
                 selectedRoipProviderId = prefs.getString(KEY_SELECTED_ROIP_PROVIDER_ID, current.selectedRoipProviderId),
+                radioHardwareAvailable = radioHardwareAvailable,
                 comjot = current.comjot.copy(
                     profile = loadedProfile,
                     developerMode = prefs.getBoolean(KEY_DEVELOPER_MODE, current.comjot.developerMode),
                     isProgrammed = false,
-                    pttActive = false
+                    pttActive = false,
+                    statusMessage = if (radioHardwareAvailable) {
+                        current.comjot.statusMessage
+                    } else {
+                        "ROIP-only phone mode"
+                    }
                 )
             )
         }
@@ -370,7 +384,12 @@ class MainViewModel(
     fun updateComjot(field: ComjotField, value: String) {
         val previousMode = _uiState.value.comjot.profile.mode
         _uiState.update { current ->
-            val updatedProfile = current.comjot.profile.withField(field, value)
+            val requestedProfile = current.comjot.profile.withField(field, value)
+            val updatedProfile = if (!current.radioHardwareAvailable && requestedProfile.mode != ComjotMode.ROIP) {
+                requestedProfile.copy(mode = ComjotMode.ROIP)
+            } else {
+                requestedProfile
+            }
             val txEnabled = updatedProfile.mode.isTxEnabled(current.comjot.developerMode)
             current.copy(
                 comjot = current.comjot.copy(
@@ -417,11 +436,12 @@ class MainViewModel(
     }
 
     fun updateRoipOperationMode(value: String) {
-        val nextMode = enumByName(
+        val requestedMode = enumByName(
             entries = RoipOperationMode.entries,
             name = value,
             fallback = _uiState.value.roipOperationMode
         )
+        val nextMode = if (_uiState.value.radioHardwareAvailable) requestedMode else RoipOperationMode.DIRECT
         if (nextMode == RoipOperationMode.HOTSPOT && _uiState.value.activeSession != null) {
             disconnect()
         }
@@ -1640,6 +1660,12 @@ class MainViewModel(
         } ?: providers.firstOrNull { it.type.providerId in DMR_PROVIDER_IDS }
     }
 
+    private fun detectRadioHardwareAvailable(): Boolean {
+        return RADIO_HARDWARE_PATHS.any { path ->
+            File(path).exists()
+        }
+    }
+
     private fun persistNow() {
         persistJob?.cancel()
         persistJob = viewModelScope.launch {
@@ -2362,5 +2388,10 @@ class MainViewModel(
         private const val LOCATION_TIMEOUT_MS = 10_000L
         private const val MAX_LAST_LOCATION_AGE_MS = 5 * 60 * 1_000L
         private const val PERSIST_DEBOUNCE_MS = 250L
+        private val RADIO_HARDWARE_PATHS = listOf(
+            "/sys/bus/platform/drivers/dmr_gpio/auctusctl",
+            "/sys/bus/platform/drivers/dmr_gpio/dmr_pwr",
+            "/sys/devices/platform/dmr_gpio/dmrptt"
+        )
     }
 }

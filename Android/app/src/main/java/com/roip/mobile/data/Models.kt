@@ -550,6 +550,7 @@ data class AppUiState(
     val accentColor: AccentColor = AccentColor.GREEN,
     val roipOperationMode: RoipOperationMode = RoipOperationMode.DIRECT,
     val selectedRoipProviderId: String? = null,
+    val radioHardwareAvailable: Boolean = true,
     val comjot: ComjotUiState = ComjotUiState(),
     val activeSession: SessionSnapshot? = null,
     val isBusy: Boolean = false,
