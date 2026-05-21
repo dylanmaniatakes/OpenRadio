@@ -15,17 +15,32 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.roip.mobile.data.HardwareButtonAction
+import com.roip.mobile.data.HardwareButtonInput
 import com.roip.mobile.ui.RoipApp
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
     private var hardwarePttDown = false
+    private val mappedButtonDown = mutableSetOf<HardwareButtonInput>()
     private var lastKnobEventAt = 0L
     private var lastKnobSignature = ""
 
     private val hardwareControlReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val action = intent.action ?: return
+            val input = hardwareInputForBroadcast(action)
+            if (input != null) {
+                val mappedAction = viewModel.hardwareButtonActionFor(input)
+                if (mappedAction != HardwareButtonAction.DEFAULT) {
+                    val pressed = action in HARDWARE_DOWN_ACTIONS
+                    handleMappedHardwareButton(input, mappedAction, pressed, source = action)
+                    return
+                }
+            }
             when (action) {
                 ACTION_PTT_DOWN,
                 ACTION_PTT_KEY_DOWN,
@@ -49,13 +64,51 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
         )
+        enterRadioOsMode()
         registerHardwarePttReceiver()
         setContent {
             RoipApp(viewModel)
         }
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            enterRadioOsMode()
+        }
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val mappedInput = event.hardwareButtonInput()
+        if (mappedInput != null) {
+            val mappedAction = viewModel.hardwareButtonActionFor(mappedInput)
+            if (mappedAction != HardwareButtonAction.DEFAULT) {
+                when (event.action) {
+                    KeyEvent.ACTION_DOWN -> {
+                        if (event.repeatCount == 0) {
+                            handleMappedHardwareButton(
+                                input = mappedInput,
+                                action = mappedAction,
+                                pressed = true,
+                                source = KeyEvent.keyCodeToString(event.keyCode)
+                            )
+                        }
+                        return true
+                    }
+
+                    KeyEvent.ACTION_UP -> {
+                        handleMappedHardwareButton(
+                            input = mappedInput,
+                            action = mappedAction,
+                            pressed = false,
+                            source = KeyEvent.keyCodeToString(event.keyCode)
+                        )
+                        return true
+                    }
+                }
+            }
+        }
+
         if (event.isKnobVolumeKey()) {
             if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
                 val direction = if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP) 1 else -1
@@ -101,6 +154,14 @@ class MainActivity : ComponentActivity() {
             viewModel.handleHardwarePtt(this, pressed = false, source = "activity-destroy")
             hardwarePttDown = false
         }
+        mappedButtonDown.toList().forEach { input ->
+            handleMappedHardwareButton(
+                input = input,
+                action = viewModel.hardwareButtonActionFor(input),
+                pressed = false,
+                source = "activity-destroy"
+            )
+        }
         super.onDestroy()
     }
 
@@ -126,14 +187,53 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun enterRadioOsMode() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+
     private fun handleHardwarePtt(pressed: Boolean, source: String) {
         if (hardwarePttDown == pressed) {
             return
         }
 
         hardwarePttDown = pressed
-        Log.i(TAG, "Hardware PTT ${if (pressed) "down" else "up"} from $source")
+        if (BuildConfig.DEBUG) {
+            Log.i(TAG, "Hardware PTT ${if (pressed) "down" else "up"} from $source")
+        }
         viewModel.handleHardwarePtt(this, pressed, source)
+    }
+
+    private fun handleMappedHardwareButton(
+        input: HardwareButtonInput,
+        action: HardwareButtonAction,
+        pressed: Boolean,
+        source: String
+    ) {
+        if (action.momentary) {
+            if (pressed && !mappedButtonDown.add(input)) {
+                return
+            }
+            if (!pressed && !mappedButtonDown.remove(input)) {
+                return
+            }
+        } else if (!pressed) {
+            return
+        }
+
+        if (BuildConfig.DEBUG) {
+            Log.i(TAG, "Mapped ${input.title} ${if (pressed) "down" else "up"} from $source to ${action.title}")
+        }
+        viewModel.handleMappedHardwareButton(
+            context = this,
+            inputName = input.name,
+            actionName = action.name,
+            pressed = pressed,
+            source = source
+        )
     }
 
     private fun handleKnobRotation(intent: Intent, source: String) {
@@ -148,7 +248,9 @@ class MainActivity : ComponentActivity() {
         lastKnobSignature = signature
         lastKnobEventAt = now
 
-        Log.i(KNOB_TAG, "Knob rotation source=$source direction=$direction steps=$steps extras=${intent.describeExtras()}")
+        if (BuildConfig.DEBUG) {
+            Log.i(KNOB_TAG, "Knob rotation source=$source direction=$direction steps=$steps extras=${intent.describeExtras()}")
+        }
         viewModel.handleKnobRotation(
             context = this,
             direction = direction,
@@ -210,6 +312,38 @@ class MainActivity : ComponentActivity() {
         return keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
     }
 
+    private fun KeyEvent.hardwareButtonInput(): HardwareButtonInput? {
+        return when (keyCode) {
+            KEYCODE_PTT_COMPAT -> HardwareButtonInput.PTT
+            KeyEvent.KEYCODE_CAMERA -> HardwareButtonInput.CAMERA
+            KeyEvent.KEYCODE_HEADSETHOOK -> HardwareButtonInput.HEADSET
+            KeyEvent.KEYCODE_STEM_PRIMARY -> HardwareButtonInput.STEM
+            KeyEvent.KEYCODE_F1 -> HardwareButtonInput.F1
+            KeyEvent.KEYCODE_F2 -> HardwareButtonInput.F2
+            KeyEvent.KEYCODE_F3 -> HardwareButtonInput.F3
+            KeyEvent.KEYCODE_F4 -> HardwareButtonInput.F4
+            KeyEvent.KEYCODE_BUTTON_L1 -> HardwareButtonInput.GAME_L1
+            KeyEvent.KEYCODE_BUTTON_R1 -> HardwareButtonInput.GAME_R1
+            KeyEvent.KEYCODE_VOLUME_UP -> HardwareButtonInput.VOLUME_UP
+            KeyEvent.KEYCODE_VOLUME_DOWN -> HardwareButtonInput.VOLUME_DOWN
+            else -> null
+        }
+    }
+
+    private fun hardwareInputForBroadcast(action: String): HardwareButtonInput? {
+        return when (action) {
+            ACTION_PTT_DOWN,
+            ACTION_PTT_UP,
+            ACTION_PTT_KEY_DOWN,
+            ACTION_PTT_KEY_UP,
+            ACTION_INTERPHONE_PTT_DOWN,
+            ACTION_INTERPHONE_PTT_UP -> HardwareButtonInput.PTT
+            ACTION_VIDEO_DOWN,
+            ACTION_VIDEO_UP -> HardwareButtonInput.VIDEO
+            else -> null
+        }
+    }
+
     private companion object {
         private const val TAG = "OpenRadioPtt"
         private const val ACTION_PTT_DOWN = "android.intent.action.PTT.down"
@@ -228,6 +362,12 @@ class MainActivity : ComponentActivity() {
 
         private val KNOB_DIRECTION_KEYS = listOf("direction", "rotation", "delta", "value", "step", "change", "timer")
         private val KNOB_STEP_KEYS = listOf("steps", "count", "amount")
+        private val HARDWARE_DOWN_ACTIONS = setOf(
+            ACTION_PTT_DOWN,
+            ACTION_PTT_KEY_DOWN,
+            ACTION_INTERPHONE_PTT_DOWN,
+            ACTION_VIDEO_DOWN
+        )
 
         private val HARDWARE_PTT_KEY_CODES = setOf(
             KEYCODE_PTT_COMPAT,

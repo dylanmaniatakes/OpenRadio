@@ -24,6 +24,7 @@
 *.dex
 *.class
 
+
 # Local config and secrets
 .env
 .env.*

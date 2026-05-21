@@ -11,14 +11,17 @@ android {
         applicationId = "com.roip.mobile"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 15
+        versionName = "Beta 1.5"
         ndkVersion = "27.0.12077973"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        buildConfigField("String", "GITHUB_OWNER", "\"DylanManiatakes\"")
+        buildConfigField("String", "GITHUB_REPO", "\"OpenRadio\"")
 
         externalNativeBuild {
             cmake {
@@ -29,7 +32,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

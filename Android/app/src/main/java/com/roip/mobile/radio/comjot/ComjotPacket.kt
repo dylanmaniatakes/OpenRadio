@@ -9,7 +9,7 @@ data class ComjotDigitalProfile(
     val timeSlot: Int = 1,
     val highPower: Boolean = true,
     val volume: Int = 6,
-    val micGain: Int = 0
+    val micGain: Int = 3
 )
 
 data class ComjotAnalogProfile(
@@ -22,8 +22,9 @@ data class ComjotAnalogProfile(
     val rxSubcode: Int = 0,
     val txToneMode: Int = 0,
     val txSubcode: Int = 0,
-    val powerSave: Boolean = true,
+    val powerSave: Boolean = false,
     val volume: Int = 6,
+    val micGain: Int = 3,
     val monitorOpen: Boolean = false,
     val repeaterDecoupling: Boolean = false
 )
@@ -93,13 +94,18 @@ object ComjotPacket {
     const val CMD_GET_VERSION = 0x34
     const val CMD_EVENTS = 0x36
     const val CMD_SET_VOLUME = 0x2E
+    const val CMD_SET_POWER_SAVE = 0x31
 
     fun setDigitalGroup(profile: ComjotDigitalProfile): ByteArray {
         val payload = ByteArray(0xA3)
         payload.putIntLe(0, profile.rxHz)
         payload.putIntLe(4, profile.txHz)
         payload.putIntLe(8, profile.localId.toLong())
-        payload.putIntLe(12, profile.talkgroup.toLong())
+
+        repeat(DIGITAL_CONTACT_REPEAT_COUNT) { index ->
+            payload.putIntLe(12 + (index * 4), profile.talkgroup.toLong())
+        }
+
         payload.putIntLe(140, profile.talkgroup.toLong())
         payload[144] = 0x01.toByte() // group call
         payload[145] = (if (profile.highPower) 0x01 else 0x00).toByte()
@@ -110,8 +116,8 @@ object ComjotPacket {
         payload[148] = zeroBasedSlot
         payload[149] = 0x00.toByte() // simplex
         payload[150] = 0x02.toByte() // encryption disabled
-        payload.fill(0x00.toByte(), fromIndex = 151, toIndex = 159)
-        payload[159] = 0x01.toByte() // power save enabled
+        "00000000".encodeToByteArray().copyInto(payload, destinationOffset = 151)
+        payload[159] = 0x02.toByte() // power save disabled for active RF use
         payload[160] = profile.volume.coerceIn(1, 9).toByte()
         payload[161] = profile.micGain.coerceIn(0, 5).toByte()
         payload[162] = 0x02.toByte() // repeater decoupling disabled
@@ -150,8 +156,12 @@ object ComjotPacket {
         return command(CMD_SET_MIC_GAIN, byteArrayOf(level.coerceIn(0, 5).toByte()))
     }
 
+    fun setPowerSave(enabled: Boolean): ByteArray {
+        return command(CMD_SET_POWER_SAVE, byteArrayOf(if (enabled) 0x01 else 0x02))
+    }
+
     fun getVersion(): ByteArray {
-        return command(CMD_GET_VERSION, mode = MODE_READ, payload = byteArrayOf())
+        return command(CMD_GET_VERSION, payload = byteArrayOf(0x01))
     }
 
     fun getInitStatus(): ByteArray {
@@ -254,4 +264,6 @@ object ComjotPacket {
         this[offset + 2] = ((value ushr 16) and 0xFF).toByte()
         this[offset + 3] = ((value ushr 24) and 0xFF).toByte()
     }
+
+    private const val DIGITAL_CONTACT_REPEAT_COUNT = 5
 }

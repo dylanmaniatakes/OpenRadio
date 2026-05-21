@@ -15,11 +15,15 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
+import java.net.URL
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.HttpsURLConnection
 import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlin.math.max
@@ -33,6 +37,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 class AllStarIaxRoipController(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO
@@ -80,6 +85,12 @@ class AllStarIaxRoipController(
     private var audioTrack: AudioTrack? = null
 
     @Volatile
+    private var audioTrackPrimedFrames = 0
+
+    @Volatile
+    private var audioTrackLastWriteMillis = 0L
+
+    @Volatile
     private var audioRecord: AudioRecord? = null
 
     @Volatile
@@ -100,20 +111,20 @@ class AllStarIaxRoipController(
     private var receiveJob: Job? = null
     private var autoLinkJob: Job? = null
     private var keepAliveJob: Job? = null
+    private var registrationRefreshJob: Job? = null
 
     suspend fun connect(provider: ProviderProfile): SessionSnapshot = withContext(dispatcher) {
         val config = AllStarIaxConfig.from(provider)
         disconnect()
 
-        val nextSocket = DatagramSocket()
+        val nextSocket = createIaxSocket(config)
         nextSocket.soTimeout = SOCKET_TIMEOUT_MS
-        val address = InetAddress.getByName(config.host)
         val nextLocalCallNumber = ((System.nanoTime().toInt() and 0x7fff).takeIf { it > 0 } ?: 1)
 
         synchronized(lock) {
             socket = nextSocket
-            remoteAddress = address
-            remotePort = config.port
+            remoteAddress = null
+            remotePort = 0
             localCallNumber = nextLocalCallNumber
             remoteCallNumber = 0
             callStartMillis = SystemClock.elapsedRealtime()
@@ -123,20 +134,55 @@ class AllStarIaxRoipController(
             activeConfig = config
             session = baseSession(config).copy(
                 phase = "authorizing",
-                statusMessage = "Calling AllStar node ${config.localNode} on ${config.host}:${config.port}"
+                statusMessage = if (config.directNodeLookup) {
+                    "Registering AllStar node ${config.localNode}"
+                } else {
+                    "Calling AllStar node ${config.calledNode} on ${config.host}:${config.port}"
+                }
             )
         }
 
+        var initialRegistration: AllStarHttpRegistrationResult? = null
         try {
+            if (config.directNodeLookup) {
+                initialRegistration = registerAllStarNode(nextSocket, config)
+                updateSession(
+                    phase = "authorizing",
+                    message = "Calling AllStar node ${config.calledNode} on ${config.host}:${config.port}"
+                )
+            }
+
+            val address = resolveIaxAddress(config.host)
+            Log.i(TAG, "Calling AllStar node ${config.calledNode} via ${config.host}/${address.hostAddress}:${config.port}")
+            synchronized(lock) {
+                remoteAddress = address
+                remotePort = config.port
+                callStartMillis = SystemClock.elapsedRealtime()
+                outboundSeq = 0
+                inboundSeq = 0
+                remoteCallNumber = 0
+            }
+
             sendNew(config, callToken = ByteArray(0), resetSequence = true)
             while (socket === nextSocket && !nextSocket.isClosed) {
                 val frame = receiveFullFrame(nextSocket)
                 if (frame.sourceCallNumber > 0 && remoteCallNumber == 0) {
                     remoteCallNumber = frame.sourceCallNumber
                 }
+                if (!isIaxAck(frame)) {
+                    inboundSeq = (frame.oSeqNo + 1) and 0xff
+                }
+
+                Log.i(
+                    TAG,
+                    "AllStar setup frame type=${frame.frameType} subclass=${frame.subclass} " +
+                        "src=${frame.sourceCallNumber} dst=${frame.destinationCallNumber} " +
+                        "oseq=${frame.oSeqNo} iseq=${frame.iSeqNo}"
+                )
 
                 if (frame.frameType == FRAME_IAX && frame.subclass == IAX_CALLTOKEN) {
                     val token = frame.ies[IE_CALLTOKEN] ?: ByteArray(0)
+                    acknowledge(frame)
                     updateSession("authorizing", "AllStar call token received")
                     sendNew(config, callToken = token, resetSequence = true)
                     continue
@@ -155,10 +201,13 @@ class AllStarIaxRoipController(
                         inboundVoiceFormat = selectedFormat
                         val connected = updateSession(
                             phase = "connected",
-                            message = "AllStar IAX link accepted. Waiting for node ${config.localNode} audio."
+                            message = "AllStar IAX link accepted. Waiting for node ${config.calledNode} audio."
                         )
                         startReceiveLoop()
                         startKeepAlive()
+                        initialRegistration?.let { registration ->
+                            startRegistrationRefresh(nextSocket, config, registration)
+                        }
                         startAutoLinkIfNeeded(config)
                         return@withContext snapshot() ?: connected
                     }
@@ -167,17 +216,22 @@ class AllStarIaxRoipController(
                         acknowledge(frame)
                         val connected = updateSession(
                             phase = "connected",
-                            message = "AllStar node ${config.localNode} answered"
+                            message = "AllStar node ${config.calledNode} answered"
                         )
                         startReceiveLoop()
                         startKeepAlive()
+                        initialRegistration?.let { registration ->
+                            startRegistrationRefresh(nextSocket, config, registration)
+                        }
                         startAutoLinkIfNeeded(config)
                         return@withContext snapshot() ?: connected
                     }
 
                     frame.frameType == FRAME_IAX && frame.subclass == IAX_REJECT -> {
                         acknowledge(frame)
-                        throw IllegalStateException(frame.rejectMessage())
+                        val reject = frame.rejectMessage()
+                        Log.w(TAG, "AllStar setup rejected: $reject")
+                        throw IllegalStateException(reject)
                     }
 
                     frame.frameType == FRAME_CONTROL && frame.subclass == CONTROL_HANGUP -> {
@@ -193,6 +247,8 @@ class AllStarIaxRoipController(
             }
             throw IllegalStateException("AllStar setup ended unexpectedly")
         } catch (error: Exception) {
+            registrationRefreshJob?.cancel()
+            registrationRefreshJob = null
             closeSocket(nextSocket)
             synchronized(lock) {
                 socket = null
@@ -208,6 +264,289 @@ class AllStarIaxRoipController(
         }
     }
 
+    private fun createIaxSocket(config: AllStarIaxConfig): DatagramSocket {
+        if (!config.directNodeLookup) {
+            return DatagramSocket().also { socket ->
+                Log.i(TAG, "Using ephemeral local UDP port ${socket.localPort} for AllStar client mode")
+            }
+        }
+        return runCatching {
+            DatagramSocket(null).also { socket ->
+                socket.reuseAddress = true
+                socket.bind(InetSocketAddress(config.port))
+                Log.i(TAG, "Bound local AllStar IAX UDP port ${socket.localPort} for node registration")
+            }
+        }.getOrElse { error ->
+            Log.w(TAG, "Unable to bind local IAX port ${config.port}", error)
+            throw IllegalStateException(
+                "AllStar UDP port ${config.port} is already in use. Disconnect the existing session or restart OpenRadio."
+            )
+        }
+    }
+
+    private fun registerAllStarNode(socket: DatagramSocket, config: AllStarIaxConfig): AllStarHttpRegistrationResult {
+        val result = registerAllStarNodeHttp(socket, config)
+        updateSession(
+            phase = "registering",
+            message = "AllStar node ${config.localNode} registered as ${result.ipAddress}:${result.port}"
+        )
+        return result
+    }
+
+    private fun startRegistrationRefresh(
+        socket: DatagramSocket,
+        config: AllStarIaxConfig,
+        registration: AllStarHttpRegistrationResult
+    ) {
+        registrationRefreshJob?.cancel()
+        registrationRefreshJob = scope.launch {
+            var delaySeconds = registration.nextRefreshSeconds()
+            while (isActive && socket === this@AllStarIaxRoipController.socket && !socket.isClosed) {
+                delay(delaySeconds * 1_000L)
+                if (!isActive || socket !== this@AllStarIaxRoipController.socket || socket.isClosed) {
+                    break
+                }
+                val refreshed = runCatching {
+                    registerAllStarNodeHttp(socket, config)
+                }.onSuccess { result ->
+                    Log.i(
+                        TAG,
+                        "AllStar HTTP registration refreshed for node ${config.localNode}; " +
+                            "next=${result.nextRefreshSeconds()}s"
+                    )
+                }.onFailure { error ->
+                    Log.w(TAG, "AllStar HTTP registration refresh failed", error)
+                }.getOrNull()
+                delaySeconds = refreshed?.nextRefreshSeconds() ?: HTTP_REGISTRATION_RETRY_SECONDS
+            }
+        }
+    }
+
+    private fun registerAllStarNodeHttp(socket: DatagramSocket, config: AllStarIaxConfig): AllStarHttpRegistrationResult {
+        val request = JSONObject().apply {
+            put("port", socket.localPort.takeIf { it > 0 } ?: config.port)
+            put(
+                "data",
+                JSONObject().apply {
+                    put(
+                        "nodes",
+                        JSONObject().apply {
+                            put(
+                                config.localNode,
+                                JSONObject().apply {
+                                    put("node", config.localNode)
+                                    put("passwd", config.password)
+                                    put("remote", 0)
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+        }.toString()
+        val requestBytes = request.toByteArray(Charsets.UTF_8)
+        val url = URL("https://$ALLSTAR_REGISTRATION_HOST/")
+        Log.i(TAG, "Starting AllStar HTTP registration for node ${config.localNode} from local UDP ${socket.localPort}")
+
+        val connection = (url.openConnection() as HttpsURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = HTTP_REGISTRATION_TIMEOUT_MS
+            readTimeout = HTTP_REGISTRATION_TIMEOUT_MS
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("User-Agent", HTTP_REGISTRATION_USER_AGENT)
+            setFixedLengthStreamingMode(requestBytes.size)
+        }
+
+        try {
+            connection.outputStream.use { output ->
+                output.write(requestBytes)
+            }
+            val code = connection.responseCode
+            val body = runCatching {
+                val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+                stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            }.getOrElse { "" }
+
+            if (code !in 200..299) {
+                Log.w(TAG, "AllStar HTTP registration failed with HTTP $code")
+                throw IOException("AllStar HTTP registration failed with HTTP $code")
+            }
+
+            val response = JSONObject(body)
+            val responseData = response.opt("data")?.toString().orEmpty()
+            val success = responseData.contains("successfully registered", ignoreCase = true)
+            if (!success) {
+                Log.w(TAG, "AllStar HTTP registration rejected: ${responseData.take(180)}")
+                throw IllegalStateException("AllStar HTTP registration rejected")
+            }
+
+            val result = AllStarHttpRegistrationResult(
+                ipAddress = response.optString("ipaddr", ""),
+                port = response.optInt("port", socket.localPort.takeIf { it > 0 } ?: config.port),
+                refresh = response.optInt("refresh", REGISTRATION_REFRESH_SECONDS)
+            )
+            Log.i(
+                TAG,
+                "AllStar HTTP registration accepted for node ${config.localNode}; " +
+                    "perceived=${result.ipAddress}:${result.port} refresh=${result.refresh}s"
+            )
+            return result
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun registerAllStarNodeIax(
+        socket: DatagramSocket,
+        config: AllStarIaxConfig,
+        registrationCallNumber: Int
+    ) {
+        val registrationAddress = resolveIaxAddress(ALLSTAR_REGISTRATION_HOST)
+        var remoteRegistrationCallNumber = 0
+        var registrationOutboundSeq = 0
+        var registrationInboundSeq = 0
+        val registrationStartMillis = SystemClock.elapsedRealtime()
+
+        Log.i(
+            TAG,
+            "Starting AllStar IAX registration for node ${config.localNode} via " +
+                "$ALLSTAR_REGISTRATION_HOST/${registrationAddress.hostAddress}:$ALLSTAR_REGISTRATION_PORT " +
+                "from local UDP ${socket.localPort}"
+        )
+
+        fun registrationTimestamp(): Int {
+            return ((SystemClock.elapsedRealtime() - registrationStartMillis) and 0xffffffffL).toInt()
+        }
+
+        fun sendRegistrationFrame(
+            subclass: Int,
+            payload: ByteArray = ByteArray(0),
+            destinationCallNumber: Int = remoteRegistrationCallNumber,
+            timestamp: Int = registrationTimestamp(),
+            advanceSequence: Boolean = true
+        ) {
+            sendFullFrameRaw(
+                socket = socket,
+                address = registrationAddress,
+                port = ALLSTAR_REGISTRATION_PORT,
+                sourceCallNumber = registrationCallNumber,
+                destinationCallNumber = destinationCallNumber,
+                timestamp = timestamp,
+                outboundSeq = registrationOutboundSeq,
+                inboundSeq = registrationInboundSeq,
+                frameType = FRAME_IAX,
+                subclass = subclass,
+                payload = payload
+            )
+            if (advanceSequence) {
+                registrationOutboundSeq = (registrationOutboundSeq + 1) and 0xff
+            }
+            Log.i(
+                TAG,
+                "Sent AllStar registration frame subclass=$subclass dst=$destinationCallNumber " +
+                    "oseq=${if (advanceSequence) (registrationOutboundSeq - 1) and 0xff else registrationOutboundSeq} " +
+                    "iseq=$registrationInboundSeq bytes=${payload.size}"
+            )
+        }
+
+        fun sendRegistrationAck(frame: IaxFrame) {
+            if (frame.sourceCallNumber == 0 || frame.subclass == IAX_ACK) {
+                return
+            }
+            sendRegistrationFrame(
+                subclass = IAX_ACK,
+                destinationCallNumber = frame.sourceCallNumber,
+                timestamp = frame.timestamp,
+                advanceSequence = false
+            )
+        }
+
+        fun registrationRequestPayload(frame: IaxFrame? = null): ByteArray {
+            val methods = frame?.ies?.get(IE_AUTHMETHODS)?.toShortValue() ?: AUTH_MD5
+            val challenge = frame?.ies?.get(IE_CHALLENGE)?.toStringValue().orEmpty()
+            return buildIes {
+                string(IE_USERNAME, config.localNode)
+                short(IE_REFRESH, REGISTRATION_REFRESH_SECONDS)
+                if (frame != null) {
+                    if ((methods and AUTH_MD5) != 0 && challenge.isNotBlank()) {
+                        string(IE_MD5_RESULT, md5Hex(challenge + config.password))
+                    } else {
+                        string(IE_PASSWORD, config.password)
+                    }
+                }
+                bytes(IE_CALLTOKEN, ByteArray(0))
+            }
+        }
+
+        Log.i(TAG, "Sending AllStar REGREQ for node ${config.localNode}")
+        sendRegistrationFrame(
+            subclass = IAX_REGREQ,
+            destinationCallNumber = 0,
+            payload = registrationRequestPayload()
+        )
+
+        val deadline = SystemClock.elapsedRealtime() + REGISTRATION_TIMEOUT_MS
+        while (SystemClock.elapsedRealtime() < deadline && !socket.isClosed) {
+            val frame = try {
+                receiveFullFrame(socket)
+            } catch (error: SocketTimeoutException) {
+                continue
+            }
+            if (frame.sourceCallNumber > 0 && remoteRegistrationCallNumber == 0) {
+                remoteRegistrationCallNumber = frame.sourceCallNumber
+            }
+            if (frame.subclass != IAX_ACK) {
+                registrationInboundSeq = (frame.oSeqNo + 1) and 0xff
+            }
+
+            Log.i(
+                TAG,
+                "AllStar registration frame type=${frame.frameType} subclass=${frame.subclass} " +
+                    "src=${frame.sourceCallNumber} dst=${frame.destinationCallNumber} " +
+                    "oseq=${frame.oSeqNo} iseq=${frame.iSeqNo}"
+            )
+
+            if (frame.frameType != FRAME_IAX) {
+                sendRegistrationAck(frame)
+                continue
+            }
+
+            when (frame.subclass) {
+                IAX_REGAUTH -> {
+                    Log.i(TAG, "AllStar registration auth challenge received")
+                    sendRegistrationAck(frame)
+                    updateSession("registering", "Authorizing AllStar node ${config.localNode}")
+                    sendRegistrationFrame(
+                        subclass = IAX_REGREQ,
+                        payload = registrationRequestPayload(frame)
+                    )
+                }
+
+                IAX_REGACK -> {
+                    sendRegistrationAck(frame)
+                    val refresh = frame.ies[IE_REFRESH]?.toShortValue() ?: REGISTRATION_REFRESH_SECONDS
+                    Log.i(TAG, "AllStar registration accepted for node ${config.localNode}; refresh=${refresh}s")
+                    updateSession("registering", "AllStar node ${config.localNode} registered for ${refresh}s")
+                    return
+                }
+
+                IAX_REGREJ -> {
+                    sendRegistrationAck(frame)
+                    val reject = frame.rejectMessage(fallback = "AllStar registration rejected")
+                    Log.w(TAG, "AllStar registration rejected: $reject")
+                    throw IllegalStateException(reject)
+                }
+
+                IAX_ACK -> Unit
+                else -> sendRegistrationAck(frame)
+            }
+        }
+
+        Log.w(TAG, "AllStar registration timed out waiting for $ALLSTAR_REGISTRATION_HOST")
+        throw SocketTimeoutException("AllStar registration timed out")
+    }
+
     suspend fun disconnect(): SessionSnapshot? = withContext(dispatcher) {
         receiveJob?.cancel()
         receiveJob = null
@@ -215,12 +554,14 @@ class AllStarIaxRoipController(
         autoLinkJob = null
         keepAliveJob?.cancel()
         keepAliveJob = null
+        registrationRefreshJob?.cancel()
+        registrationRefreshJob = null
         stopTransmit(sendUnkey = true)
         networkAudioSink = null
         resetExternalTxState()
 
         val config = activeConfig
-        if (config?.remoteNode?.isNotBlank() == true && config.autoLinked) {
+        if (config?.remoteNode?.isNotBlank() == true && config.autoLinked && !config.directNodeLookup) {
             runCatching {
                 sendDtmfSequence("*1${config.remoteNode}")
                 Thread.sleep(250)
@@ -244,6 +585,8 @@ class AllStarIaxRoipController(
             audioTrack?.release()
         }
         audioTrack = null
+        audioTrackPrimedFrames = 0
+        audioTrackLastWriteMillis = 0L
 
         synchronized(lock) {
             socket = null
@@ -265,6 +608,7 @@ class AllStarIaxRoipController(
         receiveJob?.cancel()
         autoLinkJob?.cancel()
         keepAliveJob?.cancel()
+        registrationRefreshJob?.cancel()
         networkAudioSink = null
         resetExternalTxState()
         stopTransmit(sendUnkey = false)
@@ -273,6 +617,8 @@ class AllStarIaxRoipController(
             audioTrack?.release()
         }
         audioTrack = null
+        audioTrackPrimedFrames = 0
+        audioTrackLastWriteMillis = 0L
         synchronized(lock) {
             socket = null
             remoteAddress = null
@@ -417,16 +763,24 @@ class AllStarIaxRoipController(
             inboundSeq = 0
             remoteCallNumber = 0
         }
+        Log.i(
+            TAG,
+            "Sending AllStar NEW username=${config.username} called=${config.calledNode} " +
+                "calling=${config.localNode} context=${config.context.ifBlank { "<remote default>" }} " +
+                "callTokenBytes=${callToken.size}"
+        )
         sendFullFrame(
             frameType = FRAME_IAX,
             subclass = IAX_NEW,
             destinationCallNumber = 0,
             payload = buildIes {
                 short(IE_VERSION, IAX_VERSION)
-                string(IE_CALLED_NUMBER, config.localNode)
-                string(IE_CALLING_NUMBER, "0")
+                string(IE_CALLED_NUMBER, config.calledNode)
+                string(IE_CALLING_NUMBER, config.localNode)
                 string(IE_CALLING_NAME, config.callerName)
-                string(IE_CALLED_CONTEXT, config.context)
+                if (config.context.isNotBlank()) {
+                    string(IE_CALLED_CONTEXT, config.context)
+                }
                 string(IE_USERNAME, config.username)
                 int(IE_FORMAT, FORMAT_ULAW)
                 int(IE_CAPABILITY, FORMAT_ULAW)
@@ -470,7 +824,7 @@ class AllStarIaxRoipController(
                     if (currentSocket.isClosed) {
                         break
                     }
-                    updateSession("disconnected", error.message ?: "AllStar IAX receive failed", pttActive = false)
+                    endSessionFromRemote(error.message ?: "AllStar IAX receive failed")
                     break
                 }
                 handleIncomingPacket(packet)
@@ -485,13 +839,16 @@ class AllStarIaxRoipController(
                 delay(PING_INTERVAL_MS)
                 runCatching {
                     sendFullFrame(FRAME_IAX, IAX_PING)
+                    Log.i(TAG, "Sent AllStar IAX keepalive ping")
+                }.onFailure { error ->
+                    Log.w(TAG, "AllStar IAX keepalive ping failed", error)
                 }
             }
         }
     }
 
     private fun startAutoLinkIfNeeded(config: AllStarIaxConfig) {
-        if (config.remoteNode.isBlank() || config.remoteNode == config.localNode || config.autoLinked) {
+        if (config.directNodeLookup || config.remoteNode.isBlank() || config.remoteNode == config.localNode || config.autoLinked) {
             return
         }
         autoLinkJob?.cancel()
@@ -529,8 +886,17 @@ class AllStarIaxRoipController(
         if (frame.sourceCallNumber > 0 && remoteCallNumber == 0) {
             remoteCallNumber = frame.sourceCallNumber
         }
-        if (frame.subclass != IAX_ACK) {
+        if (!isIaxAck(frame)) {
             inboundSeq = (frame.oSeqNo + 1) and 0xff
+        }
+
+        if (frame.frameType != FRAME_VOICE) {
+            Log.i(
+                TAG,
+                "AllStar RX full frame type=${frame.frameType} subclass=${frame.subclass} " +
+                    "src=${frame.sourceCallNumber} dst=${frame.destinationCallNumber} " +
+                    "oseq=${frame.oSeqNo} iseq=${frame.iSeqNo}"
+            )
         }
 
         when (frame.frameType) {
@@ -560,11 +926,15 @@ class AllStarIaxRoipController(
             IAX_PONG, IAX_LAGRP -> acknowledge(frame)
             IAX_REJECT -> {
                 acknowledge(frame)
-                updateSession("disconnected", frame.rejectMessage(), pttActive = false)
+                val reject = frame.rejectMessage()
+                Log.w(TAG, "AllStar IAX rejected active call: $reject")
+                endSessionFromRemote(reject)
             }
             IAX_HANGUP -> {
                 acknowledge(frame)
-                updateSession("disconnected", frame.rejectMessage(fallback = "AllStar server hung up"), pttActive = false)
+                val hangup = frame.hangupMessage(activeConfig)
+                Log.w(TAG, "AllStar IAX hangup: $hangup")
+                endSessionFromRemote(hangup)
             }
             else -> acknowledge(frame)
         }
@@ -577,10 +947,61 @@ class AllStarIaxRoipController(
             CONTROL_RINGING -> updateSession("linking", "AllStar node is ringing")
             CONTROL_KEY_RADIO -> updateInbound("AllStar RX keyed")
             CONTROL_UNKEY_RADIO -> updateInbound("AllStar RX idle")
-            CONTROL_HANGUP -> updateSession("disconnected", "AllStar server hung up", pttActive = false)
-            CONTROL_BUSY -> updateSession("disconnected", "AllStar node is busy", pttActive = false)
-            CONTROL_CONGESTION -> updateSession("disconnected", "AllStar node is congested", pttActive = false)
+            CONTROL_HANGUP -> {
+                Log.w(TAG, "AllStar control hangup")
+                endSessionFromRemote("AllStar server hung up")
+            }
+            CONTROL_BUSY -> {
+                Log.w(TAG, "AllStar control busy")
+                endSessionFromRemote("AllStar node is busy")
+            }
+            CONTROL_CONGESTION -> {
+                Log.w(TAG, "AllStar control congestion")
+                endSessionFromRemote("AllStar node is congested")
+            }
         }
+    }
+
+    private fun endSessionFromRemote(message: String) {
+        keepAliveJob?.cancel()
+        keepAliveJob = null
+        registrationRefreshJob?.cancel()
+        registrationRefreshJob = null
+        autoLinkJob?.cancel()
+        autoLinkJob = null
+        stopTransmit(sendUnkey = false)
+        networkAudioSink = null
+        resetExternalTxState()
+        closeSocket(socket)
+        runCatching {
+            audioTrack?.pause()
+            audioTrack?.flush()
+            audioTrack?.release()
+        }
+        audioTrack = null
+        audioTrackPrimedFrames = 0
+        audioTrackLastWriteMillis = 0L
+        synchronized(lock) {
+            socket = null
+            remoteAddress = null
+            remotePort = 0
+            localCallNumber = 0
+            remoteCallNumber = 0
+            activeConfig = null
+            session = session?.copy(
+                phase = "disconnected",
+                statusMessage = message,
+                pttActive = false
+            )
+        }
+    }
+
+    private fun IaxFrame.hangupMessage(config: AllStarIaxConfig?): String {
+        val rawMessage = rejectMessage(fallback = "AllStar server hung up")
+        if (rawMessage == "code 0" && config?.directNodeLookup == true) {
+            return "Remote node dropped the link after setup. Check for a stale link, busy node, or allow/deny rule."
+        }
+        return rawMessage
     }
 
     private fun handleMiniFrame(packet: ByteArray) {
@@ -611,12 +1032,29 @@ class AllStarIaxRoipController(
             updateInbound("AllStar RX audio to RF")
             return
         }
+        val now = SystemClock.elapsedRealtime()
         val track = audioTrack ?: createAudioTrack().also {
             audioTrack = it
-            it.play()
+            audioTrackPrimedFrames = 0
+            audioTrackLastWriteMillis = 0L
+        }
+        if (
+            audioTrackLastWriteMillis > 0L &&
+            now - audioTrackLastWriteMillis > AUDIO_GAP_RESET_MS
+        ) {
+            runCatching { track.pause() }
+            runCatching { track.flush() }
+            audioTrackPrimedFrames = 0
         }
         val written = track.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
         if (written > 0) {
+            audioTrackLastWriteMillis = now
+            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                audioTrackPrimedFrames += 1
+                if (audioTrackPrimedFrames >= AUDIO_PREFILL_FRAMES) {
+                    track.play()
+                }
+            }
             updateInbound("AllStar RX audio")
         }
     }
@@ -632,21 +1070,24 @@ class AllStarIaxRoipController(
 
         txThread = thread(start = true, isDaemon = true, name = "AllStar-IAX-TX-Audio") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-            val record = runCatching { createAudioRecord() }.getOrElse { error ->
+            val capture = runCatching { createAudioRecord() }.getOrElse { error ->
                 txRunning.set(false)
                 updateSession("connected", error.message ?: "AllStar microphone failed", pttActive = false)
                 return@thread
             }
+            val record = capture.record
             audioRecord = record
             try {
                 record.startRecording()
                 if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
                     throw IOException("AudioRecord could not start")
                 }
+                Log.i(TAG, "AllStar TX audio capture started with ${capture.sourceLabel}")
                 val pcm = ShortArray(ULAW_FRAME_SAMPLES)
                 var frameIndex = 0
                 while (txRunning.get()) {
                     fillAudioFrame(record, pcm)
+                    val peak = pcm.peak()
                     val ulaw = ByteArray(pcm.size)
                     pcm.forEachIndexed { index, sample ->
                         ulaw[index] = G711.linearToUlaw(sample)
@@ -658,9 +1099,10 @@ class AllStarIaxRoipController(
                     }
                     frameIndex += 1
                     if (frameIndex % TX_STATUS_INTERVAL == 0) {
+                        Log.i(TAG, "AllStar TX audio $frameIndex frames peak $peak source=${capture.sourceLabel}")
                         updateSession(
                             phase = "transmitting",
-                            message = "AllStar TX audio ${frameIndex} frames peak ${pcm.peak()}",
+                            message = "AllStar TX audio ${frameIndex} frames peak $peak",
                             pttActive = true
                         )
                     }
@@ -722,7 +1164,7 @@ class AllStarIaxRoipController(
     }
 
     private fun acknowledge(frame: IaxFrame) {
-        if (frame.subclass == IAX_ACK || frame.sourceCallNumber == 0) {
+        if (isIaxAck(frame) || frame.sourceCallNumber == 0) {
             return
         }
         sendFullFrame(
@@ -745,8 +1187,43 @@ class AllStarIaxRoipController(
         val currentSocket = socket ?: throw IllegalStateException("AllStar IAX socket is not active")
         val currentAddress = remoteAddress ?: throw IllegalStateException("AllStar IAX server address is not active")
         val currentPort = remotePort.takeIf { it > 0 } ?: throw IllegalStateException("AllStar IAX server port is not active")
+        sendFullFrameRaw(
+            socket = currentSocket,
+            address = currentAddress,
+            port = currentPort,
+            sourceCallNumber = localCallNumber,
+            destinationCallNumber = destinationCallNumber,
+            timestamp = timestamp,
+            outboundSeq = outboundSeq,
+            inboundSeq = inboundSeq,
+            frameType = frameType,
+            subclass = subclass,
+            payload = payload
+        )
+        if (advanceSequence) {
+            outboundSeq = (outboundSeq + 1) and 0xff
+        }
+    }
+
+    private fun isIaxAck(frame: IaxFrame): Boolean {
+        return frame.frameType == FRAME_IAX && frame.subclass == IAX_ACK
+    }
+
+    private fun sendFullFrameRaw(
+        socket: DatagramSocket,
+        address: InetAddress,
+        port: Int,
+        sourceCallNumber: Int,
+        destinationCallNumber: Int,
+        timestamp: Int,
+        outboundSeq: Int,
+        inboundSeq: Int,
+        frameType: Int,
+        subclass: Int,
+        payload: ByteArray = ByteArray(0)
+    ) {
         val bytes = ByteArray(FULL_HEADER_BYTES + payload.size)
-        val src = FULL_FRAME_BIT or (localCallNumber and 0x7fff)
+        val src = FULL_FRAME_BIT or (sourceCallNumber and 0x7fff)
         bytes.putU16(0, src)
         bytes.putU16(2, destinationCallNumber and 0x7fff)
         bytes.putU32(4, timestamp)
@@ -756,10 +1233,7 @@ class AllStarIaxRoipController(
         bytes[11] = encodeSubclass(subclass)
         payload.copyInto(bytes, FULL_HEADER_BYTES)
         synchronized(sendLock) {
-            currentSocket.send(DatagramPacket(bytes, bytes.size, currentAddress, currentPort))
-        }
-        if (advanceSequence) {
-            outboundSeq = (outboundSeq + 1) and 0xff
+            socket.send(DatagramPacket(bytes, bytes.size, address, port))
         }
     }
 
@@ -825,7 +1299,7 @@ class AllStarIaxRoipController(
                 .filter { it.isNotBlank() }
                 .joinToString(" -> ")
                 .ifBlank { config.localNode },
-            serverHost = config.host,
+            serverHost = config.serverLabel,
             transport = IAX_TRANSPORT,
             warnings = emptyList(),
             pttActive = false,
@@ -870,13 +1344,24 @@ class AllStarIaxRoipController(
         }
     }
 
+    private fun resolveIaxAddress(host: String): InetAddress {
+        val addresses = InetAddress.getAllByName(host).toList()
+        val selected = addresses.firstOrNull { it is Inet4Address } ?: addresses.first()
+        Log.i(
+            TAG,
+            "Resolved $host to ${addresses.joinToString { it.hostAddress ?: it.hostName }}; " +
+                "using ${selected.hostAddress}"
+        )
+        return selected
+    }
+
     private fun elapsedTimestamp(): Int {
         val start = callStartMillis.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
         return ((SystemClock.elapsedRealtime() - start) and 0xffffffffL).toInt()
     }
 
     @SuppressLint("MissingPermission")
-    private fun createAudioRecord(): AudioRecord {
+    private fun createAudioRecord(): AudioRecordCapture {
         val minBuffer = AudioRecord.getMinBufferSize(
             SAMPLE_RATE_HZ,
             AudioFormat.CHANNEL_IN_MONO,
@@ -887,24 +1372,33 @@ class AllStarIaxRoipController(
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
             .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
             .build()
-        val record = runCatching {
-            AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.UNPROCESSED)
-                .setAudioFormat(audioFormat)
-                .setBufferSizeInBytes(max(minBuffer.takeIf { it > 0 } ?: 0, AUDIO_BUFFER_BYTES))
-                .build()
-        }.getOrElse {
-            AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.MIC)
-                .setAudioFormat(audioFormat)
-                .setBufferSizeInBytes(max(minBuffer.takeIf { it > 0 } ?: 0, AUDIO_BUFFER_BYTES))
-                .build()
-        }
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
+        val bufferSize = max(minBuffer.takeIf { it > 0 } ?: 0, AUDIO_BUFFER_BYTES)
+        val sources = listOf(
+            MediaRecorder.AudioSource.MIC to "Android mic",
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION to "voice communication mic",
+            MediaRecorder.AudioSource.UNPROCESSED to "unprocessed mic"
+        )
+        var lastError: Throwable? = null
+        for ((source, label) in sources) {
+            val record = try {
+                AudioRecord.Builder()
+                    .setAudioSource(source)
+                    .setAudioFormat(audioFormat)
+                    .setBufferSizeInBytes(bufferSize)
+                    .build()
+            } catch (error: Throwable) {
+                lastError = error
+                Log.w(TAG, "AllStar AudioRecord source $label failed to build", error)
+                null
+            } ?: continue
+            if (record.state == AudioRecord.STATE_INITIALIZED) {
+                return AudioRecordCapture(record, label)
+            }
             runCatching { record.release() }
-            throw IOException("AudioRecord initialization failed")
+            lastError = IOException("AudioRecord source $label was not initialized")
+            Log.w(TAG, "AllStar AudioRecord source $label was not initialized")
         }
-        return record
+        throw IOException("AudioRecord initialization failed", lastError)
     }
 
     private fun createAudioTrack(): AudioTrack {
@@ -950,6 +1444,8 @@ class AllStarIaxRoipController(
 
         private const val TAG = "AllStarIax"
         private const val ALLSTAR_PROVIDER_ID = "allstar"
+        private const val ALLSTAR_REGISTRATION_HOST = "register.allstarlink.org"
+        private const val ALLSTAR_REGISTRATION_PORT = 4569
         private const val IAX_VERSION = 2
         private const val FULL_FRAME_BIT = 0x8000
         private const val FULL_HEADER_BYTES = 12
@@ -957,11 +1453,18 @@ class AllStarIaxRoipController(
         private const val RECEIVE_BYTES = 2048
         private const val SOCKET_TIMEOUT_MS = 12_000
         private const val RECEIVE_TIMEOUT_MS = 600
+        private const val HTTP_REGISTRATION_TIMEOUT_MS = 15_000
+        private const val HTTP_REGISTRATION_USER_AGENT = "OpenRadio/0.1.0"
+        private const val HTTP_REGISTRATION_RETRY_SECONDS = 30
         private const val PING_INTERVAL_MS = 30_000L
         private const val AUTOLINK_DELAY_MS = 1_200L
         private const val DTMF_GAP_MS = 140L
+        private const val REGISTRATION_TIMEOUT_MS = 12_000L
+        private const val REGISTRATION_REFRESH_SECONDS = 60
         private const val SAMPLE_RATE_HZ = 8_000
-        private const val AUDIO_BUFFER_BYTES = 8_000
+        private const val AUDIO_BUFFER_BYTES = 24_000
+        private const val AUDIO_PREFILL_FRAMES = 4
+        private const val AUDIO_GAP_RESET_MS = 180L
         private const val ULAW_FRAME_SAMPLES = 160
         private const val FULL_VOICE_INTERVAL = 150
         private const val TX_STATUS_INTERVAL = 50
@@ -990,6 +1493,10 @@ class AllStarIaxRoipController(
         private const val IAX_AUTHREP = 9
         private const val IAX_LAGRQ = 11
         private const val IAX_LAGRP = 12
+        private const val IAX_REGREQ = 13
+        private const val IAX_REGAUTH = 14
+        private const val IAX_REGACK = 15
+        private const val IAX_REGREJ = 16
         private const val IAX_CALLTOKEN = 40
 
         private const val IE_CALLED_NUMBER = 0x01
@@ -1005,6 +1512,7 @@ class AllStarIaxRoipController(
         private const val IE_AUTHMETHODS = 0x0e
         private const val IE_CHALLENGE = 0x0f
         private const val IE_MD5_RESULT = 0x10
+        private const val IE_REFRESH = 0x13
         private const val IE_CAUSE = 0x16
         private const val IE_CAUSECODE = 0x2a
         private const val IE_CALLTOKEN = 0x36
@@ -1020,9 +1528,12 @@ private data class AllStarIaxConfig(
     val callerName: String,
     val localNode: String,
     val remoteNode: String,
+    val calledNode: String,
     val host: String,
     val port: Int,
     val context: String,
+    val serverLabel: String,
+    val directNodeLookup: Boolean,
     var autoLinked: Boolean = false
 ) {
     companion object {
@@ -1030,26 +1541,84 @@ private data class AllStarIaxConfig(
             require(provider.type.providerId == "allstar") {
                 "AllStar IAX controller can only connect AllStar profiles"
             }
-            val host = provider.serverHost.trim().removePrefix("iax://").removePrefix("iax:")
             val port = provider.serverPort.toIntOrNull()?.takeIf { it in 1..65535 }
                 ?: throw IllegalArgumentException("AllStar IAX port must be 1-65535")
             val localNode = provider.stationId.onlyDigits()
                 .ifBlank { throw IllegalArgumentException("AllStar Local Node is required") }
+            val password = provider.password.ifBlank {
+                throw IllegalArgumentException("AllStar Node password is required")
+            }
+            val remoteNode = provider.target.onlyDigits()
+            val hostOverride = provider.serverHost.trim().removePrefix("iax://").removePrefix("iax:")
+            val directNodeLookup = hostOverride.isAutoAllStarHost()
+            val host = if (directNodeLookup) {
+                remoteNode.ifBlank {
+                    throw IllegalArgumentException("AllStar Remote Node is required when server is blank or Auto")
+                }.let { "$it.$ALLSTAR_NODE_DNS_DOMAIN" }
+            } else {
+                hostOverride
+            }
+            val calledNode = if (directNodeLookup) remoteNode else localNode
+            val contextSetting = provider.timeSlot.trim()
+            val context = if (directNodeLookup) {
+                if (contextSetting == DEFAULT_CLIENT_CONTEXT || contextSetting == DEFAULT_NODE_CONTEXT) {
+                    ""
+                } else {
+                    contextSetting
+                }
+            } else {
+                contextSetting.ifBlank { DEFAULT_CLIENT_CONTEXT }
+            }
+            val username = if (directNodeLookup) {
+                NODE_TO_NODE_USERNAME
+            } else {
+                provider.username.trim().ifBlank { localNode }
+            }
             return AllStarIaxConfig(
-                username = provider.username.trim().ifBlank {
-                    throw IllegalArgumentException("AllStar IAX username is required")
-                },
-                password = provider.password,
-                callerName = provider.callsign.trim().ifBlank { provider.username.trim() },
+                username = username,
+                password = password,
+                callerName = provider.callsign.trim().ifBlank { username },
                 localNode = localNode,
-                remoteNode = provider.target.onlyDigits(),
+                remoteNode = remoteNode,
+                calledNode = calledNode,
                 host = host,
                 port = port,
-                context = provider.timeSlot.trim().ifBlank { "iaxrpt" }
+                context = context,
+                serverLabel = if (directNodeLookup) {
+                    "Auto ${remoteNode}.$ALLSTAR_NODE_DNS_DOMAIN"
+                } else {
+                    "$host:$port"
+                },
+                directNodeLookup = directNodeLookup
             )
         }
+
+        private const val ALLSTAR_NODE_DNS_DOMAIN = "nodes.allstarlink.org"
+        private const val DEFAULT_CLIENT_CONTEXT = "iaxrpt"
+        private const val DEFAULT_NODE_CONTEXT = "radio-secure"
+        private const val NODE_TO_NODE_USERNAME = "radio"
     }
 }
+
+private data class AllStarHttpRegistrationResult(
+    val ipAddress: String,
+    val port: Int,
+    val refresh: Int
+) {
+    fun nextRefreshSeconds(): Int {
+        return (refresh - 30).coerceIn(HTTP_REGISTRATION_MIN_REFRESH_SECONDS, HTTP_REGISTRATION_MAX_REFRESH_SECONDS)
+    }
+
+    companion object {
+        private const val HTTP_REGISTRATION_MIN_REFRESH_SECONDS = 30
+        private const val HTTP_REGISTRATION_MAX_REFRESH_SECONDS = 45
+    }
+}
+
+private data class AudioRecordCapture(
+    val record: AudioRecord,
+    val sourceLabel: String
+)
 
 private data class IaxFrame(
     val sourceCallNumber: Int,
@@ -1189,6 +1758,14 @@ private fun ByteArray.toIntValue(): Int {
 
 private fun String.onlyDigits(): String {
     return filter { it.isDigit() }
+}
+
+private fun String.isAutoAllStarHost(): Boolean {
+    val normalized = trim().lowercase()
+    return normalized.isBlank() ||
+        normalized == "auto" ||
+        normalized == "allstar.example.net" ||
+        normalized == "nodes.allstarlink.org"
 }
 
 private fun md5Hex(value: String): String {

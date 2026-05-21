@@ -1,10 +1,16 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
 
 #include "mbevocoder.h"
 
@@ -15,6 +21,90 @@ extern "C" {
 namespace {
 
 constexpr int kPcmSamples = 160;
+
+void throwIOException(JNIEnv *env, const std::string &message) {
+    jclass exceptionClass = env->FindClass("java/io/IOException");
+    if (exceptionClass != nullptr) {
+        env->ThrowNew(exceptionClass, message.c_str());
+    }
+}
+
+speed_t baudToSpeed(int baud) {
+    switch (baud) {
+        case 9600:
+            return B9600;
+        case 19200:
+            return B19200;
+        case 38400:
+            return B38400;
+        case 57600:
+            return B57600;
+        case 115200:
+            return B115200;
+        case 230400:
+            return B230400;
+        default:
+            return 0;
+    }
+}
+
+int speedToBaud(speed_t speed) {
+    switch (speed) {
+        case B9600:
+            return 9600;
+        case B19200:
+            return 19200;
+        case B38400:
+            return 38400;
+        case B57600:
+            return 57600;
+        case B115200:
+            return 115200;
+        case B230400:
+            return 230400;
+        default:
+            return 0;
+    }
+}
+
+bool configureSerialFd(int fd, int baud, std::string *error) {
+    const speed_t speed = baudToSpeed(baud);
+    if (speed == 0) {
+        *error = "unsupported baud rate " + std::to_string(baud);
+        return false;
+    }
+
+    termios options {};
+    if (tcgetattr(fd, &options) != 0) {
+        *error = "tcgetattr failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+
+    cfsetispeed(&options, speed);
+    cfsetospeed(&options, speed);
+
+    options.c_cflag |= CLOCAL | CREAD;
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag |= CS8;
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~CSTOPB;
+#ifdef CRTSCTS
+    options.c_cflag &= ~CRTSCTS;
+#endif
+
+    options.c_iflag = 0;
+    options.c_oflag = 0;
+    options.c_lflag = 0;
+    options.c_cc[VMIN] = 0;
+    options.c_cc[VTIME] = 0;
+
+    if (tcsetattr(fd, TCSANOW, &options) != 0) {
+        *error = "tcsetattr failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    tcflush(fd, TCIOFLUSH);
+    return true;
+}
 
 const int rW[36] = {
     0, 1, 0, 1, 0, 1,
@@ -207,4 +297,152 @@ Java_com_roip_mobile_radio_roip_NativeDmrAmbeEncoder_nativeResetEncoder(
 ) {
     std::lock_guard<std::mutex> lock(gEncoderMutex);
     gEncoder = std::make_unique<MBEVocoder>();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_roip_mobile_radio_comjot_ComjotNativeSerial_00024Companion_nativeOpen(
+    JNIEnv *env,
+    jobject,
+    jstring path,
+    jint baud
+) {
+    const char *rawPath = env->GetStringUTFChars(path, nullptr);
+    if (rawPath == nullptr) {
+        throwIOException(env, "serial path is null");
+        return -1;
+    }
+
+    const int fd = open(rawPath, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    const std::string pathCopy(rawPath);
+    env->ReleaseStringUTFChars(path, rawPath);
+
+    if (fd < 0) {
+        throwIOException(env, "open " + pathCopy + " failed: " + std::strerror(errno));
+        return -1;
+    }
+
+    std::string error;
+    if (!configureSerialFd(fd, baud, &error)) {
+        close(fd);
+        throwIOException(env, "configure " + pathCopy + " failed: " + error);
+        return -1;
+    }
+
+    return fd;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_roip_mobile_radio_comjot_ComjotNativeSerial_00024Companion_nativeConfiguredBaud(
+    JNIEnv *,
+    jobject,
+    jint fd
+) {
+    termios options {};
+    if (tcgetattr(fd, &options) != 0) {
+        return 0;
+    }
+    return speedToBaud(cfgetispeed(&options));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_roip_mobile_radio_comjot_ComjotNativeSerial_00024Companion_nativeAvailable(
+    JNIEnv *,
+    jobject,
+    jint fd
+) {
+    int available = 0;
+    if (ioctl(fd, FIONREAD, &available) != 0) {
+        return 0;
+    }
+    return available;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_roip_mobile_radio_comjot_ComjotNativeSerial_00024Companion_nativeRead(
+    JNIEnv *env,
+    jobject,
+    jint fd,
+    jint maxBytes
+) {
+    if (maxBytes <= 0) {
+        return env->NewByteArray(0);
+    }
+
+    std::unique_ptr<uint8_t[]> buffer(new uint8_t[maxBytes]);
+    ssize_t readCount;
+    do {
+        readCount = read(fd, buffer.get(), static_cast<size_t>(maxBytes));
+    } while (readCount < 0 && errno == EINTR);
+
+    if (readCount <= 0) {
+        return env->NewByteArray(0);
+    }
+
+    jbyteArray output = env->NewByteArray(static_cast<jsize>(readCount));
+    env->SetByteArrayRegion(
+        output,
+        0,
+        static_cast<jsize>(readCount),
+        reinterpret_cast<jbyte *>(buffer.get())
+    );
+    return output;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_roip_mobile_radio_comjot_ComjotNativeSerial_00024Companion_nativeWrite(
+    JNIEnv *env,
+    jobject,
+    jint fd,
+    jbyteArray packet,
+    jboolean drain
+) {
+    const jsize length = env->GetArrayLength(packet);
+    if (length <= 0) {
+        return 0;
+    }
+
+    jbyte *bytes = env->GetByteArrayElements(packet, nullptr);
+    if (bytes == nullptr) {
+        throwIOException(env, "serial write failed: packet bytes unavailable");
+        return 0;
+    }
+
+    int total = 0;
+    while (total < length) {
+        const ssize_t written = write(
+            fd,
+            bytes + total,
+            static_cast<size_t>(length - total)
+        );
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            const std::string error = std::strerror(errno);
+            env->ReleaseByteArrayElements(packet, bytes, JNI_ABORT);
+            throwIOException(env, "serial write failed: " + error);
+            return total;
+        }
+        if (written == 0) {
+            break;
+        }
+        total += static_cast<int>(written);
+    }
+
+    env->ReleaseByteArrayElements(packet, bytes, JNI_ABORT);
+    if (drain == JNI_TRUE) {
+        tcdrain(fd);
+    }
+    return total;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_roip_mobile_radio_comjot_ComjotNativeSerial_00024Companion_nativeClose(
+    JNIEnv *,
+    jobject,
+    jint fd
+) {
+    if (fd >= 0) {
+        close(fd);
+    }
 }

@@ -5,9 +5,12 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
@@ -20,8 +23,17 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+
+enum class ComjotTransmitAudioFormat(
+    val frameBytes: Int,
+    val intervalNanos: Long,
+    val label: String
+) {
+    DIGITAL_10MS(frameBytes = 160, intervalNanos = 10_000_000L, label = "160B/10ms")
+}
 
 class ComjotAudioBridge(
     private val voiceSerialPath: String = DEFAULT_VOICE_SERIAL_PATH
@@ -31,12 +43,22 @@ class ComjotAudioBridge(
     private val transmitRunning = AtomicBoolean(false)
     private val receivedFrames = AtomicLong(0)
     private val transmittedFrames = AtomicLong(0)
+    private val recordedMicFrames = AtomicLong(0)
+    private val transmitUnderruns = AtomicLong(0)
+    private val rawReceiveReads = AtomicLong(0)
+    private val rawReceiveBytes = AtomicLong(0)
+    private val receivePlaybackUnderruns = AtomicLong(0)
+    private val receiveAudioQueue = ArrayBlockingQueue<ByteArray>(RX_QUEUE_DEPTH)
+    private val receivePlaybackRunning = AtomicBoolean(false)
 
     @Volatile
     private var voiceSerialConfigured = false
 
     @Volatile
     private var receiveThread: Thread? = null
+
+    @Volatile
+    private var receivePlaybackThread: Thread? = null
 
     @Volatile
     private var transmitThread: Thread? = null
@@ -51,10 +73,40 @@ class ComjotAudioBridge(
     private var transmitOutput: FileOutputStream? = null
 
     @Volatile
+    private var receiveSerial: ComjotNativeSerial? = null
+
+    @Volatile
+    private var transmitSerial: ComjotNativeSerial? = null
+
+    @Volatile
     private var audioTrack: AudioTrack? = null
 
     @Volatile
     private var audioRecord: AudioRecord? = null
+
+    @Volatile
+    private var transmitAudioManager: AudioManager? = null
+
+    @Volatile
+    private var transmitFocusRequest: AudioFocusRequest? = null
+
+    @Volatile
+    private var transmitWakeLock: PowerManager.WakeLock? = null
+
+    @Volatile
+    private var transmitStartedAtNanos = 0L
+
+    @Volatile
+    private var activeTransmitFrameBytes = ComjotTransmitAudioFormat.DIGITAL_10MS.frameBytes
+
+    @Volatile
+    private var activeTransmitSourceLabel = "unknown"
+
+    @Volatile
+    private var activeTransmitInputGain = 1.0f
+
+    private var transmitHighPassPreviousInput = 0f
+    private var transmitHighPassPreviousOutput = 0f
 
     @Volatile
     private var receivePcmSink: ((ShortArray) -> Unit)? = null
@@ -75,10 +127,15 @@ class ComjotAudioBridge(
             return true
         }
 
-        configureVoiceSerial()
+        val nativeSerial = openVoiceSerialSession("RX")
+        val input = if (nativeSerial == null) FileInputStream(voiceSerial) else null
+        receiveSerial = nativeSerial
+        receiveInput = input
         receivePcmSink = null
-        audioTrack = createAudioTrack()
+        audioTrack = createAudioTrack().also { startReceivePlayback(it) }
         receivedFrames.set(0)
+        rawReceiveReads.set(0)
+        rawReceiveBytes.set(0)
         receiveRunning.set(true)
         Log.i(TAG, "CJ-1 RX audio started on $voiceSerialPath")
         receiveThread = thread(
@@ -86,7 +143,7 @@ class ComjotAudioBridge(
             isDaemon = true,
             name = "CJ1-RX-Audio"
         ) {
-            runReceiveLoop()
+            runReceiveLoop(nativeSerial, input)
         }
         return true
     }
@@ -102,17 +159,26 @@ class ComjotAudioBridge(
         if (receiveRunning.get()) {
             receivePcmSink = onPcm
             if (playLocalMonitor && audioTrack == null) {
-                audioTrack = createAudioTrack()
+                audioTrack = createAudioTrack().also { startReceivePlayback(it) }
             } else if (!playLocalMonitor) {
                 releaseAudioTrack()
             }
             return true
         }
 
-        configureVoiceSerial()
+        val nativeSerial = openVoiceSerialSession("RX bridge")
+        val input = if (nativeSerial == null) FileInputStream(voiceSerial) else null
+        receiveSerial = nativeSerial
+        receiveInput = input
         receivePcmSink = onPcm
-        audioTrack = if (playLocalMonitor) createAudioTrack() else null
+        audioTrack = if (playLocalMonitor) {
+            createAudioTrack().also { startReceivePlayback(it) }
+        } else {
+            null
+        }
         receivedFrames.set(0)
+        rawReceiveReads.set(0)
+        rawReceiveBytes.set(0)
         receiveRunning.set(true)
         Log.i(TAG, "CJ-1 RF bridge RX audio started on $voiceSerialPath")
         receiveThread = thread(
@@ -120,14 +186,15 @@ class ComjotAudioBridge(
             isDaemon = true,
             name = "CJ1-RF-Bridge-RX"
         ) {
-            runReceiveLoop()
+            runReceiveLoop(nativeSerial, input)
         }
         return true
     }
 
     fun startTransmit(
         context: Context,
-        onPcm: ((ShortArray) -> Unit)? = null
+        onPcm: ((ShortArray) -> Unit)? = null,
+        audioFormat: ComjotTransmitAudioFormat = ComjotTransmitAudioFormat.DIGITAL_10MS
     ) {
         if (transmitRunning.get()) {
             transmitPcmSink = onPcm
@@ -142,52 +209,67 @@ class ComjotAudioBridge(
             throw IOException("$voiceSerialPath is not writable")
         }
 
-        configureVoiceSerial()
-        val record = createAudioRecord()
-        val output = FileOutputStream(voiceSerial)
-        audioRecord = record
+        stopReceiveForTransmit()
+        val nativeSerial = openVoiceSerialSession("TX")
+        val output = if (nativeSerial == null) FileOutputStream(voiceSerial) else null
+        transmitSerial = nativeSerial
         transmitOutput = output
         transmitPcmSink = onPcm
         transmittedFrames.set(0)
+        recordedMicFrames.set(0)
+        transmitUnderruns.set(0)
+        transmitStartedAtNanos = 0L
+        activeTransmitFrameBytes = audioFormat.frameBytes
+        activeTransmitSourceLabel = "unknown"
+        activeTransmitInputGain = 1.0f
+        resetTransmitConditioner()
         transmitQueue.clear()
         repeat(TX_PREFILL_FRAMES) {
-            transmitQueue.offer(ByteArray(TX_FRAME_SIZE))
+            transmitQueue.offer(ByteArray(audioFormat.frameBytes))
         }
-        transmitRunning.set(true)
+        acquireTransmitWakeLock(context)
 
-        try {
-            record.startRecording()
+        val record = try {
+            createStartedAudioRecord(context, audioFormat.frameBytes)
         } catch (error: Exception) {
-            transmitRunning.set(false)
             runCatching {
-                record.release()
+                output?.close()
             }
             runCatching {
-                output.close()
+                nativeSerial?.close()
             }
-            audioRecord = null
+            transmitSerial = null
             transmitOutput = null
-            throw IOException("AudioRecord could not start", error)
+            transmitPcmSink = null
+            transmitQueue.clear()
+            releaseTransmitWakeLock()
+            throw error
         }
+        audioRecord = record
+        transmitStartedAtNanos = SystemClock.elapsedRealtimeNanos()
+        transmitRunning.set(true)
 
         recordThread = thread(
             start = true,
             isDaemon = true,
-            name = "CJ1-TX-Record"
+            name = "CJ1-TX-Recorder"
         ) {
-            runRecordLoop(record)
+            runRecordLoop(record, audioFormat.frameBytes)
         }
+
         transmitThread = thread(
             start = true,
             isDaemon = true,
-            name = "CJ1-TX-Audio"
+            name = "CJ1-TX-Serial"
         ) {
-            runTransmitLoop(output)
+            runTransmitLoop(nativeSerial, output, audioFormat)
         }
-        Log.i(TAG, "CJ-1 TX audio started on $voiceSerialPath")
+        Log.i(TAG, "CJ-1 TX audio started on $voiceSerialPath using ${audioFormat.label}")
     }
 
-    fun startExternalTransmit() {
+    fun startExternalTransmit(
+        audioFormat: ComjotTransmitAudioFormat = ComjotTransmitAudioFormat.DIGITAL_10MS
+    ) {
         if (transmitRunning.get()) {
             return
         }
@@ -197,13 +279,17 @@ class ComjotAudioBridge(
             throw IOException("$voiceSerialPath is not writable")
         }
 
-        configureVoiceSerial()
-        val output = FileOutputStream(voiceSerial)
+        stopReceiveForTransmit()
+        val nativeSerial = openVoiceSerialSession("RF bridge TX")
+        val output = if (nativeSerial == null) FileOutputStream(voiceSerial) else null
+        transmitSerial = nativeSerial
         transmitOutput = output
         transmittedFrames.set(0)
+        transmitUnderruns.set(0)
+        activeTransmitFrameBytes = audioFormat.frameBytes
         transmitQueue.clear()
         repeat(TX_PREFILL_FRAMES) {
-            transmitQueue.offer(ByteArray(TX_FRAME_SIZE))
+            transmitQueue.offer(ByteArray(audioFormat.frameBytes))
         }
         transmitRunning.set(true)
         transmitThread = thread(
@@ -211,9 +297,9 @@ class ComjotAudioBridge(
             isDaemon = true,
             name = "CJ1-RF-Bridge-TX"
         ) {
-            runTransmitLoop(output)
+            runTransmitLoop(nativeSerial, output, audioFormat)
         }
-        Log.i(TAG, "CJ-1 RF bridge TX audio started on $voiceSerialPath")
+        Log.i(TAG, "CJ-1 RF bridge TX audio started on $voiceSerialPath using ${audioFormat.label}")
     }
 
     fun enqueueExternalPcm(pcm: ShortArray) {
@@ -222,8 +308,9 @@ class ComjotAudioBridge(
         }
         var offset = 0
         while (offset < pcm.size) {
-            val samples = min(TX_FRAME_SIZE / 2, pcm.size - offset)
-            val frame = ByteArray(TX_FRAME_SIZE)
+            val frameBytes = activeTransmitFrameBytes
+            val samples = min(frameBytes / 2, pcm.size - offset)
+            val frame = ByteArray(frameBytes)
             for (index in 0 until samples) {
                 val sample = pcm[offset + index].toInt()
                 val byteOffset = index * 2
@@ -254,6 +341,11 @@ class ComjotAudioBridge(
             transmitOutput?.close()
         }
         runCatching {
+            transmitSerial?.close()
+        }
+        abandonTransmitAudioFocus()
+        releaseTransmitWakeLock()
+        runCatching {
             audioRecord?.release()
         }
         runCatching {
@@ -261,12 +353,20 @@ class ComjotAudioBridge(
         }
 
         transmitOutput = null
+        transmitSerial = null
         audioRecord = null
         transmitPcmSink = null
         recordThread = null
         transmitThread = null
         transmitQueue.clear()
-        Log.i(TAG, "CJ-1 TX audio stopped after ${transmittedFrames.get()} frames")
+        val durationSeconds = ((SystemClock.elapsedRealtimeNanos() - transmitStartedAtNanos).coerceAtLeast(1L)) /
+            1_000_000_000.0
+        val frames = transmittedFrames.get()
+        Log.i(
+            TAG,
+            "CJ-1 TX audio stopped after $frames frames " +
+                "fps=${"%.1f".format(frames / durationSeconds)}"
+        )
     }
 
     fun shutdown() {
@@ -282,6 +382,9 @@ class ComjotAudioBridge(
         runCatching {
             receiveInput?.close()
         }
+        runCatching {
+            receiveSerial?.close()
+        }
         releaseAudioTrack()
         runCatching {
             receiveThread?.join(300)
@@ -289,34 +392,132 @@ class ComjotAudioBridge(
 
         pendingReceiveSize = 0
         receiveInput = null
-        audioTrack = null
+        receiveSerial = null
         receiveThread = null
         receivePcmSink = null
+        audioTrack = null
         Log.i(TAG, "CJ-1 RX audio stopped after ${receivedFrames.get()} frames")
     }
 
-    private fun releaseAudioTrack() {
-        runCatching {
-            audioTrack?.pause()
+    private fun stopReceiveForTransmit() {
+        if (!receiveRunning.get()) {
+            return
         }
-        runCatching {
-            audioTrack?.flush()
-        }
-        runCatching {
-            audioTrack?.release()
-        }
-        audioTrack = null
+        Log.i(TAG, "Pausing CJ-1 RX audio while TX owns $voiceSerialPath")
+        stopReceive()
     }
 
-    private fun runReceiveLoop() {
+    private fun releaseAudioTrack() {
+        val track = audioTrack
+        receivePlaybackRunning.set(false)
+        receiveAudioQueue.clear()
+        runCatching {
+            track?.pause()
+        }
+        runCatching {
+            track?.flush()
+        }
+        runCatching {
+            receivePlaybackThread?.takeIf { it != Thread.currentThread() }?.join(300)
+        }
+        runCatching {
+            track?.release()
+        }
+        audioTrack = null
+        receivePlaybackThread = null
+    }
+
+    private fun startReceivePlayback(track: AudioTrack) {
+        receiveAudioQueue.clear()
+        receivePlaybackUnderruns.set(0)
+        if (receivePlaybackRunning.getAndSet(true)) {
+            return
+        }
+        receivePlaybackThread = thread(
+            start = true,
+            isDaemon = true,
+            name = "CJ1-RX-Playback"
+        ) {
+            runReceivePlaybackLoop(track)
+        }
+    }
+
+    private fun runReceivePlaybackLoop(track: AudioTrack) {
+        Thread.currentThread().priority = Thread.MAX_PRIORITY
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        var started = false
+        var idlePolls = 0
         try {
-            FileInputStream(voiceSerialPath).use { input ->
-                receiveInput = input
-                val buffer = ByteArray(640)
+            while (receivePlaybackRunning.get()) {
+                val audio = receiveAudioQueue.poll(RX_PLAYBACK_POLL_MS, TimeUnit.MILLISECONDS)
+                if (audio == null) {
+                    if (started) {
+                        noteReceivePlaybackUnderrun()
+                        if (idlePolls < RX_SILENCE_FILL_FRAMES) {
+                            writeReceiveAudioFrame(track, ByteArray(VOICE_AUDIO_BYTES))
+                            idlePolls += 1
+                        } else {
+                            runCatching { track.pause() }
+                            runCatching { track.flush() }
+                            started = false
+                            idlePolls = 0
+                        }
+                    }
+                    continue
+                }
+
+                if (!started) {
+                    val prebuffer = ArrayList<ByteArray>(RX_PREFILL_FRAMES + 1)
+                    prebuffer.add(audio)
+                    val deadline = SystemClock.elapsedRealtime() + RX_PREFILL_TIMEOUT_MS
+                    while (prebuffer.size < RX_PREFILL_FRAMES && SystemClock.elapsedRealtime() < deadline) {
+                        val remainingMs = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)
+                        receiveAudioQueue.poll(min(remainingMs, RX_PLAYBACK_POLL_MS), TimeUnit.MILLISECONDS)
+                            ?.let { prebuffer.add(it) }
+                    }
+                    prebuffer.forEach { writeReceiveAudioFrame(track, it) }
+                    track.play()
+                    started = true
+                    idlePolls = 0
+                } else {
+                    writeReceiveAudioFrame(track, audio)
+                    idlePolls = 0
+                }
+            }
+        } catch (error: Exception) {
+            if (receivePlaybackRunning.get()) {
+                Log.w(TAG, "CJ-1 RX playback loop stopped", error)
+            }
+        } finally {
+            receivePlaybackRunning.set(false)
+        }
+    }
+
+    private fun runReceiveLoop(
+        nativeSerial: ComjotNativeSerial?,
+        fallbackInput: FileInputStream?
+    ) {
+        try {
+            if (nativeSerial != null) {
                 while (receiveRunning.get()) {
-                    val count = input.read(buffer)
-                    if (count > 0) {
-                        processReceiveBytes(buffer, count)
+                    val data = nativeSerial.readAvailable(RECEIVE_READ_BYTES)
+                    if (data.isNotEmpty()) {
+                        noteRawReceive(data.size)
+                        processReceiveBytes(data, data.size)
+                    } else {
+                        Thread.sleep(VOICE_READ_IDLE_MS)
+                    }
+                }
+            } else {
+                (fallbackInput ?: FileInputStream(voiceSerialPath)).use { input ->
+                    receiveInput = input
+                    val buffer = ByteArray(RECEIVE_READ_BYTES)
+                    while (receiveRunning.get()) {
+                        val count = input.read(buffer)
+                        if (count > 0) {
+                            noteRawReceive(count)
+                            processReceiveBytes(buffer, count)
+                        }
                     }
                 }
             }
@@ -330,9 +531,10 @@ class ComjotAudioBridge(
         }
     }
 
-    private fun runRecordLoop(record: AudioRecord) {
+    private fun runRecordLoop(record: AudioRecord, frameBytes: Int) {
+        Thread.currentThread().priority = Thread.MAX_PRIORITY
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-        val frame = ByteArray(TX_FRAME_SIZE)
+        val frame = ByteArray(frameBytes)
         var offset = 0
         try {
             while (transmitRunning.get()) {
@@ -341,7 +543,9 @@ class ComjotAudioBridge(
                     count > 0 -> {
                         offset += count
                         if (offset == frame.size) {
-                            val audioFrame = frame.copyOf()
+                            val rawFrame = frame.copyOf()
+                            val audioFrame = conditionTransmitFrame(rawFrame)
+                            noteTransmitMicFrame(rawFrame, audioFrame)
                             offerTransmitFrame(audioFrame)
                             transmitPcmSink?.invoke(audioFrame.toShortArrayLe())
                             offset = 0
@@ -360,31 +564,53 @@ class ComjotAudioBridge(
         }
     }
 
-    private fun runTransmitLoop(output: FileOutputStream) {
+    private fun runTransmitLoop(
+        nativeSerial: ComjotNativeSerial?,
+        output: FileOutputStream?,
+        audioFormat: ComjotTransmitAudioFormat
+    ) {
+        Thread.currentThread().priority = Thread.MAX_PRIORITY
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-        var nextFrameAt = SystemClock.elapsedRealtimeNanos()
+        val intervalMs = (audioFormat.intervalNanos / NANOS_PER_MILLI).coerceAtLeast(1L)
+        var lastFrameAt = SystemClock.elapsedRealtime()
+        var nextFrameAt = lastFrameAt
+        var consecutiveEmptyFrames = 0
         try {
             while (transmitRunning.get()) {
-                val now = SystemClock.elapsedRealtimeNanos()
-                if (now < nextFrameAt) {
-                    val sleepMs = (nextFrameAt - now) / NANOS_PER_MILLI
-                    if (sleepMs > 0) {
-                        Thread.sleep(sleepMs)
-                    } else {
-                        Thread.yield()
-                    }
-                    continue
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastFrameAt > TX_TIMING_GAP_RESET_MS) {
+                    Log.d(TAG, "CJ-1 TX large timing gap=${now - lastFrameAt}ms; resetting cadence")
+                    nextFrameAt = now
                 }
 
-                val frame = transmitQueue.poll() ?: ByteArray(TX_FRAME_SIZE)
-                output.write(frame)
-                output.flush()
-                noteTransmitFrame()
-                nextFrameAt += TX_FRAME_INTERVAL_NANOS
+                val waitMs = nextFrameAt - now
+                if (waitMs > 0L) {
+                    if (waitMs > 1L) {
+                        Thread.sleep(waitMs - 1L)
+                    }
+                    while (SystemClock.elapsedRealtime() < nextFrameAt && transmitRunning.get()) {
+                        Thread.yield()
+                    }
+                }
 
-                val lateBy = SystemClock.elapsedRealtimeNanos() - nextFrameAt
-                if (lateBy > TX_FRAME_INTERVAL_NANOS) {
-                    nextFrameAt = SystemClock.elapsedRealtimeNanos() + TX_FRAME_INTERVAL_NANOS
+                val targetForNextFrame = SystemClock.elapsedRealtime() + intervalMs
+                val frame = transmitQueue.poll()
+                if (frame != null) {
+                    writeTransmitFrame(nativeSerial, output, frame)
+                    noteTransmitFrame()
+                    lastFrameAt = SystemClock.elapsedRealtime()
+                    nextFrameAt = targetForNextFrame
+                    consecutiveEmptyFrames = 0
+                } else {
+                    consecutiveEmptyFrames++
+                    noteTransmitUnderrun()
+                    if (consecutiveEmptyFrames > TX_EMPTY_SILENCE_THRESHOLD) {
+                        writeTransmitFrame(nativeSerial, output, ByteArray(audioFormat.frameBytes))
+                        noteTransmitFrame()
+                        lastFrameAt = SystemClock.elapsedRealtime()
+                        consecutiveEmptyFrames = 0
+                    }
+                    nextFrameAt = SystemClock.elapsedRealtime() + TX_EMPTY_RETRY_DELAY_MS
                 }
             }
         } catch (error: Exception) {
@@ -394,6 +620,51 @@ class ComjotAudioBridge(
         } finally {
             transmitRunning.set(false)
         }
+    }
+
+    private fun acquireTransmitWakeLock(context: Context) {
+        val existing = transmitWakeLock
+        if (existing?.isHeld == true) {
+            return
+        }
+
+        val powerManager = context.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            ?: return
+        transmitWakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "OpenRadio:CJ1Tx"
+        ).apply {
+            setReferenceCounted(false)
+            acquire(TX_WAKE_LOCK_TIMEOUT_MS)
+        }
+    }
+
+    private fun releaseTransmitWakeLock() {
+        val wakeLock = transmitWakeLock
+        transmitWakeLock = null
+        if (wakeLock?.isHeld == true) {
+            runCatching {
+                wakeLock.release()
+            }
+        }
+    }
+
+    private fun writeTransmitFrame(
+        nativeSerial: ComjotNativeSerial?,
+        output: FileOutputStream?,
+        frame: ByteArray
+    ) {
+        if (nativeSerial != null) {
+            val written = nativeSerial.write(frame, drain = false)
+            if (written != frame.size) {
+                throw IOException("Expected to write ${frame.size} voice bytes, wrote $written")
+            }
+            return
+        }
+
+        val fallbackOutput = output ?: throw IOException("voice output stream is not open")
+        fallbackOutput.write(frame)
+        fallbackOutput.flush()
     }
 
     private fun offerTransmitFrame(frame: ByteArray) {
@@ -407,8 +678,84 @@ class ComjotAudioBridge(
     private fun noteTransmitFrame() {
         val frameCount = transmittedFrames.incrementAndGet()
         if (frameCount % LOG_FRAME_INTERVAL == 0L) {
-            Log.d(TAG, "CJ-1 TX audio frames=$frameCount")
+            Log.d(
+                TAG,
+                "CJ-1 TX audio frames=$frameCount underruns=${transmitUnderruns.get()} " +
+                    "queue=${transmitQueue.size}"
+            )
         }
+    }
+
+    private fun noteTransmitUnderrun() {
+        val underruns = transmitUnderruns.incrementAndGet()
+        if (underruns <= 5L || underruns % UNDERRUN_LOG_INTERVAL == 0L) {
+            Log.w(TAG, "CJ-1 TX underrun; sent silence frame count=$underruns")
+        }
+    }
+
+    private fun resetTransmitConditioner() {
+        transmitHighPassPreviousInput = 0f
+        transmitHighPassPreviousOutput = 0f
+    }
+
+    private fun conditionTransmitFrame(frame: ByteArray): ByteArray {
+        val output = ByteArray(frame.size - (frame.size % 2))
+        var index = 0
+        while (index < output.size) {
+            val sample = ((frame[index + 1].toInt() shl 8) or (frame[index].toInt() and 0xFF)).toShort().toInt()
+            val scaledInput = sample * activeTransmitInputGain
+            val highPassed = scaledInput -
+                transmitHighPassPreviousInput +
+                (TX_HIGH_PASS_COEFFICIENT * transmitHighPassPreviousOutput)
+            transmitHighPassPreviousInput = scaledInput
+            transmitHighPassPreviousOutput = highPassed
+
+            val conditioned = softLimitTransmitSample(highPassed * TX_OUTPUT_GAIN)
+            output[index] = (conditioned and 0xFF).toByte()
+            output[index + 1] = ((conditioned ushr 8) and 0xFF).toByte()
+            index += 2
+        }
+        return output
+    }
+
+    private fun softLimitTransmitSample(sample: Float): Int {
+        val polarity = if (sample < 0f) -1 else 1
+        val magnitude = abs(sample)
+        val limited = if (magnitude <= TX_SOFT_LIMIT_THRESHOLD) {
+            magnitude
+        } else {
+            TX_SOFT_LIMIT_THRESHOLD +
+                ((magnitude - TX_SOFT_LIMIT_THRESHOLD) * TX_SOFT_LIMIT_RATIO)
+        }
+        return (min(limited, TX_SOFT_LIMIT_CEILING) * polarity)
+            .toInt()
+            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+    }
+
+    private fun noteTransmitMicFrame(rawFrame: ByteArray, conditionedFrame: ByteArray) {
+        val rawPeak = pcmPeak(rawFrame)
+        val txPeak = pcmPeak(conditionedFrame)
+        val frameCount = recordedMicFrames.incrementAndGet()
+        if (frameCount <= 5L || frameCount % MIC_LOG_INTERVAL == 0L) {
+            Log.i(
+                TAG,
+                "CJ-1 TX mic frames=$frameCount rawPeak=$rawPeak txPeak=$txPeak " +
+                    "source=$activeTransmitSourceLabel gain=${"%.2f".format(activeTransmitInputGain)} " +
+                    "queue=${transmitQueue.size}"
+            )
+        }
+    }
+
+    private fun pcmPeak(frame: ByteArray, count: Int = frame.size): Int {
+        var index = 0
+        var peak = 0
+        val limit = min(count, frame.size)
+        while (index < limit - 1) {
+            val sample = ((frame[index + 1].toInt() shl 8) or (frame[index].toInt() and 0xFF)).toShort().toInt()
+            peak = max(peak, abs(sample))
+            index += 2
+        }
+        return peak
     }
 
     private fun processReceiveBytes(buffer: ByteArray, count: Int) {
@@ -435,7 +782,7 @@ class ComjotAudioBridge(
                     receivePcmSink?.invoke(amplified.toShortArrayLe())
                     val track = audioTrack
                     if (track != null) {
-                        writeReceiveAudio(track, amplified)
+                        enqueueReceiveAudio(amplified)
                     } else {
                         noteReceiveFrame()
                     }
@@ -451,6 +798,21 @@ class ComjotAudioBridge(
         val frameCount = receivedFrames.incrementAndGet()
         if (frameCount <= 5L || frameCount % LOG_FRAME_INTERVAL == 0L) {
             Log.d(TAG, "CJ-1 RX bridge audio frames=$frameCount")
+        }
+    }
+
+    private fun noteRawReceive(count: Int) {
+        val reads = rawReceiveReads.incrementAndGet()
+        val bytes = rawReceiveBytes.addAndGet(count.toLong())
+        if (reads <= 5L || reads % RAW_LOG_INTERVAL == 0L) {
+            Log.d(TAG, "CJ-1 RX raw read bytes=$count totalBytes=$bytes")
+        }
+    }
+
+    private fun noteReceivePlaybackUnderrun() {
+        val underruns = receivePlaybackUnderruns.incrementAndGet()
+        if (underruns <= 5L || underruns % RX_UNDERRUN_LOG_INTERVAL == 0L) {
+            Log.w(TAG, "CJ-1 RX playback underrun count=$underruns queued=${receiveAudioQueue.size}")
         }
     }
 
@@ -558,11 +920,15 @@ class ComjotAudioBridge(
             frame[VOICE_FRAME_SIZE - 1] == VOICE_FRAME_TAIL.toByte()
     }
 
-    private fun writeReceiveAudio(track: AudioTrack, audio: ByteArray) {
-        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-            track.play()
+    private fun enqueueReceiveAudio(audio: ByteArray) {
+        if (receiveAudioQueue.offer(audio.copyOf())) {
+            return
         }
+        receiveAudioQueue.poll()
+        receiveAudioQueue.offer(audio.copyOf())
+    }
 
+    private fun writeReceiveAudioFrame(track: AudioTrack, audio: ByteArray) {
         val written = track.write(audio, 0, audio.size, AudioTrack.WRITE_BLOCKING)
         if (written < 0) {
             Log.w(TAG, "AudioTrack write returned $written")
@@ -571,7 +937,7 @@ class ComjotAudioBridge(
 
         val frameCount = receivedFrames.incrementAndGet()
         if (frameCount <= 5L || frameCount % LOG_FRAME_INTERVAL == 0L) {
-            Log.d(TAG, "CJ-1 RX audio frames=$frameCount")
+            Log.d(TAG, "CJ-1 RX audio frames=$frameCount queued=${receiveAudioQueue.size}")
         }
     }
 
@@ -580,12 +946,26 @@ class ComjotAudioBridge(
         var index = 0
         while (index < output.size) {
             val sample = ((audio[index + 1].toInt() shl 8) or (audio[index].toInt() and 0xFF)).toShort()
-            val amplified = (sample * RX_GAIN).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+            val amplified = softLimitReceiveSample(sample * RX_GAIN)
             output[index] = (amplified and 0xFF).toByte()
             output[index + 1] = ((amplified ushr 8) and 0xFF).toByte()
             index += 2
         }
         return output
+    }
+
+    private fun softLimitReceiveSample(sample: Float): Int {
+        val polarity = if (sample < 0f) -1 else 1
+        val magnitude = abs(sample)
+        val limited = if (magnitude <= RX_SOFT_LIMIT_THRESHOLD) {
+            magnitude
+        } else {
+            RX_SOFT_LIMIT_THRESHOLD +
+                ((magnitude - RX_SOFT_LIMIT_THRESHOLD) * RX_SOFT_LIMIT_RATIO)
+        }
+        return (min(limited, RX_SOFT_LIMIT_CEILING) * polarity)
+            .toInt()
+            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
     }
 
     private fun ByteArray.toShortArrayLe(): ShortArray {
@@ -633,40 +1013,209 @@ class ComjotAudioBridge(
         return track
     }
 
-    private fun createAudioRecord(): AudioRecord {
+    private fun createStartedAudioRecord(context: Context, frameBytes: Int): AudioRecord {
         val minBuffer = AudioRecord.getMinBufferSize(
             SAMPLE_RATE_HZ,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        val bufferSize = max((minBuffer.takeIf { it > 0 } ?: TX_FRAME_SIZE) * 4, TX_BUFFER_BYTES)
+        val bufferSize = max((minBuffer.takeIf { it > 0 } ?: frameBytes) * 4, max(TX_BUFFER_BYTES, frameBytes * 4))
         val audioFormat = AudioFormat.Builder()
             .setSampleRate(SAMPLE_RATE_HZ)
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
             .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
             .build()
+        var lastError: Throwable? = null
+        var bestLowSignalCandidate: AudioSourceCandidate? = null
+        var bestLowSignalPeak = -1
+        for (candidate in AUDIO_SOURCES) {
+            val record = createAudioRecord(candidate, audioFormat, bufferSize)
+                ?: continue
+
+            try {
+                requestTransmitAudioFocus(context)
+                record.startRecording()
+                if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    val probePeak = probeAudioRecordPeak(record, frameBytes)
+                    Log.i(TAG, "CJ-1 TX microphone source probe: ${candidate.label} peak=$probePeak")
+                    if (
+                        candidate.acceptQuietSignal ||
+                        probePeak >= TX_SOURCE_MIN_PEAK
+                    ) {
+                        activeTransmitSourceLabel = candidate.label
+                        activeTransmitInputGain = candidate.inputGain
+                        Log.i(TAG, "CJ-1 TX microphone source active: ${candidate.label}")
+                        return record
+                    }
+                    if (probePeak > bestLowSignalPeak) {
+                        bestLowSignalPeak = probePeak
+                        bestLowSignalCandidate = candidate
+                    }
+                    throw IOException(
+                        "AudioRecord source ${candidate.label} probe peak $probePeak below " +
+                            TX_SOURCE_MIN_PEAK.toInt()
+                    )
+                }
+
+                throw IOException(
+                    "AudioRecord source ${candidate.label} did not enter recording state " +
+                        "(${record.recordingState})"
+                )
+            } catch (error: Exception) {
+                lastError = error
+                Log.w(TAG, "CJ-1 TX microphone source ${candidate.label} failed to start", error)
+                abandonTransmitAudioFocus()
+                runCatching {
+                    record.release()
+                }
+            }
+        }
+
+        bestLowSignalCandidate?.let { candidate ->
+            Log.w(
+                TAG,
+                "CJ-1 TX microphone sources were quiet; falling back to ${candidate.label} " +
+                    "with probe peak=$bestLowSignalPeak"
+            )
+            return createStartedFallbackAudioRecord(context, candidate, audioFormat, bufferSize)
+        }
+
+        val reason = lastError?.message ?: "unknown failure"
+        throw IOException("AudioRecord could not start for any microphone source: $reason", lastError)
+    }
+
+    private fun createStartedFallbackAudioRecord(
+        context: Context,
+        candidate: AudioSourceCandidate,
+        audioFormat: AudioFormat,
+        bufferSize: Int
+    ): AudioRecord {
+        val record = createAudioRecord(candidate, audioFormat, bufferSize)
+            ?: throw IOException("AudioRecord fallback source ${candidate.label} could not be created")
+        try {
+            requestTransmitAudioFocus(context)
+            record.startRecording()
+            if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                activeTransmitSourceLabel = "${candidate.label} fallback"
+                activeTransmitInputGain = candidate.inputGain
+                Log.i(TAG, "CJ-1 TX microphone source active: ${candidate.label} fallback")
+                return record
+            }
+            throw IOException("AudioRecord fallback source ${candidate.label} did not enter recording state")
+        } catch (error: Exception) {
+            abandonTransmitAudioFocus()
+            runCatching {
+                record.release()
+            }
+            throw IOException("AudioRecord fallback source ${candidate.label} could not start", error)
+        }
+    }
+
+    private fun probeAudioRecordPeak(record: AudioRecord, frameBytes: Int): Int {
+        val probeFrame = ByteArray(frameBytes)
+        var peak = 0
+        repeat(TX_SOURCE_PROBE_FRAMES) {
+            val count = record.read(probeFrame, 0, probeFrame.size, AudioRecord.READ_BLOCKING)
+            if (count > 0) {
+                peak = max(peak, pcmPeak(probeFrame, count))
+            }
+        }
+        return peak
+    }
+
+    private fun createAudioRecord(
+        candidate: AudioSourceCandidate,
+        audioFormat: AudioFormat,
+        bufferSize: Int
+    ): AudioRecord? {
         val record = runCatching {
             AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.UNPROCESSED)
+                .setAudioSource(candidate.source)
                 .setAudioFormat(audioFormat)
                 .setBufferSizeInBytes(bufferSize)
                 .build()
         }.getOrElse { error ->
-            Log.w(TAG, "UNPROCESSED microphone source failed, falling back to MIC", error)
-            AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.MIC)
-                .setAudioFormat(audioFormat)
-                .setBufferSizeInBytes(bufferSize)
-                .build()
+            Log.w(TAG, "CJ-1 TX microphone source ${candidate.label} failed to build", error)
+            return null
         }
 
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
-            runCatching {
-                record.release()
-            }
-            throw IOException("AudioRecord initialization failed")
+        if (record.state == AudioRecord.STATE_INITIALIZED) {
+            Log.i(TAG, "CJ-1 TX microphone source initialized: ${candidate.label}")
+            return record
         }
-        return record
+
+        Log.w(TAG, "CJ-1 TX microphone source ${candidate.label} was not initialized")
+        runCatching {
+            record.release()
+        }
+        return null
+    }
+
+    private fun requestTransmitAudioFocus(context: Context) {
+        val audioManager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            ?: return
+
+        runCatching {
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setWillPauseWhenDucked(false)
+                .build()
+
+            val result = audioManager.requestAudioFocus(request)
+            if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                transmitAudioManager = audioManager
+                transmitFocusRequest = request
+            }
+            Log.i(TAG, "CJ-1 TX audio focus result=$result")
+        }.onFailure { error ->
+            Log.w(
+                TAG,
+                "CJ-1 TX audio focus request failed; continuing without focus",
+                error
+            )
+        }
+    }
+
+    private fun abandonTransmitAudioFocus() {
+        val request = transmitFocusRequest
+        val manager = transmitAudioManager
+        if (request != null && manager != null) {
+            runCatching {
+                manager.abandonAudioFocusRequest(request)
+            }
+        }
+        transmitFocusRequest = null
+        transmitAudioManager = null
+    }
+
+    private fun openVoiceSerialSession(purpose: String): ComjotNativeSerial? {
+        if (!ComjotNativeSerial.isAvailable) {
+            configureVoiceSerial()
+            return null
+        }
+
+        return runCatching {
+            ComjotNativeSerial.open(voiceSerialPath, VOICE_SERIAL_BAUD).also { serial ->
+                Log.i(
+                    TAG,
+                    "Opened CJ-1 voice serial $voiceSerialPath for $purpose with native fd " +
+                        "at ${serial.configuredBaud} baud"
+                )
+            }
+        }.getOrElse { error ->
+            Log.w(
+                TAG,
+                "Native voice serial open failed for $voiceSerialPath; falling back to Java streams",
+                error
+            )
+            configureVoiceSerial()
+            null
+        }
     }
 
     private fun configureVoiceSerial() {
@@ -712,13 +1261,23 @@ class ComjotAudioBridge(
         private const val DEFAULT_VOICE_SERIAL_PATH = "/dev/ttyS0"
         private const val VOICE_SERIAL_BAUD = 230_400
         private const val SAMPLE_RATE_HZ = 8_000
-        private const val TX_FRAME_SIZE = 160
         private const val TX_QUEUE_DEPTH = 8
-        private const val TX_PREFILL_FRAMES = 3
-        private const val TX_FRAME_INTERVAL_NANOS = 10_000_000L
+        private const val TX_PREFILL_FRAMES = 8
         private const val NANOS_PER_MILLI = 1_000_000L
+        private const val TX_TIMING_GAP_RESET_MS = 20L
+        private const val TX_EMPTY_RETRY_DELAY_MS = 5L
+        private const val TX_EMPTY_SILENCE_THRESHOLD = 5
+        private const val TX_WAKE_LOCK_TIMEOUT_MS = 30 * 60 * 1000L
         private const val TX_BUFFER_BYTES = 640
-        private const val RX_BUFFER_BYTES = 5_120
+        private const val RX_BUFFER_BYTES = 16_384
+        private const val RX_QUEUE_DEPTH = 96
+        private const val RX_PREFILL_FRAMES = 6
+        private const val RX_PREFILL_TIMEOUT_MS = 160L
+        private const val RX_PLAYBACK_POLL_MS = 40L
+        private const val RX_SILENCE_FILL_FRAMES = 4
+        private const val RX_UNDERRUN_LOG_INTERVAL = 25L
+        private const val RECEIVE_READ_BYTES = 640
+        private const val VOICE_READ_IDLE_MS = 5L
         private const val VOICE_FRAME_HEAD = 0xBB
         private const val VOICE_FRAME_TAIL = 0x44
         private const val VOICE_HEADER_SIZE = 3
@@ -726,8 +1285,60 @@ class ComjotAudioBridge(
         private const val VOICE_AUDIO_OFFSET = 6
         private const val VOICE_AUDIO_BYTES = 160
         private const val RECEIVE_SCAN_BUFFER_BYTES = VOICE_FRAME_SIZE * 8
-        private const val RX_GAIN = 2.5f
-        private const val LOG_FRAME_INTERVAL = 100L
+        private const val RX_GAIN = 1.4f
+        private const val RX_SOFT_LIMIT_THRESHOLD = 16_000f
+        private const val RX_SOFT_LIMIT_RATIO = 0.35f
+        private const val RX_SOFT_LIMIT_CEILING = 24_000f
+        private const val LOG_FRAME_INTERVAL = 250L
+        private const val RAW_LOG_INTERVAL = 500L
+        private const val MIC_LOG_INTERVAL = 100L
+        private const val UNDERRUN_LOG_INTERVAL = 25L
+        private const val TX_SOURCE_PROBE_FRAMES = 6
+        private const val TX_SOURCE_MIN_PEAK = 64
+        private const val TX_HIGH_PASS_COEFFICIENT = 0.995f
+        private const val TX_OUTPUT_GAIN = 1.0f
+        private const val TX_SOFT_LIMIT_THRESHOLD = 5_200f
+        private const val TX_SOFT_LIMIT_RATIO = 0.25f
+        private const val TX_SOFT_LIMIT_CEILING = 9_000f
+
+        private data class AudioSourceCandidate(
+            val source: Int,
+            val label: String,
+            val acceptQuietSignal: Boolean = false,
+            val inputGain: Float = 1.0f
+        )
+
+        private val AUDIO_SOURCES = listOf(
+            AudioSourceCandidate(
+                MediaRecorder.AudioSource.UNPROCESSED,
+                "unprocessed mic",
+                acceptQuietSignal = true,
+                inputGain = 8.0f
+            ),
+            AudioSourceCandidate(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                "voice recognition mic",
+                inputGain = 3.0f
+            ),
+            AudioSourceCandidate(
+                MediaRecorder.AudioSource.MIC,
+                "Android MIC",
+                acceptQuietSignal = true,
+                inputGain = 0.8f
+            ),
+            AudioSourceCandidate(
+                MediaRecorder.AudioSource.CAMCORDER,
+                "camcorder mic",
+                acceptQuietSignal = true,
+                inputGain = 0.8f
+            ),
+            AudioSourceCandidate(
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                "voice communication mic",
+                inputGain = 1.5f
+            ),
+            AudioSourceCandidate(MediaRecorder.AudioSource.DEFAULT, "default mic")
+        )
 
         private val INTERNAL_STTY_PATHS = listOf(
             "/system/bin/stty",

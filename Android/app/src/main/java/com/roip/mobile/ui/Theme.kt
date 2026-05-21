@@ -19,11 +19,12 @@ private val LightColors = lightColorScheme(
     secondary = Color(0xFF7A5C00),
     onSecondary = Color(0xFFFFFFFF),
     tertiary = Color(0xFF365CA8),
-    background = Color(0xFFF4F6F3),
-    surface = Color(0xFFFFFFFF),
-    surfaceVariant = Color(0xFFE5EAE3),
+    background = Color(0xFFEDF3EF),
+    surface = Color(0xFFF8FBF8),
+    surfaceVariant = Color(0xFFDDE7E1),
     onSurface = Color(0xFF151916),
     onSurfaceVariant = Color(0xFF505950),
+    outline = Color(0xFF6A776F),
     error = Color(0xFFB3261E)
 )
 
@@ -33,11 +34,12 @@ private val DarkColors = darkColorScheme(
     secondary = Color(0xFFE2C36B),
     onSecondary = Color(0xFF3C2F00),
     tertiary = Color(0xFFAFC6FF),
-    background = Color(0xFF101412),
-    surface = Color(0xFF171C19),
-    surfaceVariant = Color(0xFF2E3833),
-    onSurface = Color(0xFFE7EEE9),
-    onSurfaceVariant = Color(0xFFBFCBC3),
+    background = Color(0xFF040706),
+    surface = Color(0xFF0A100D),
+    surfaceVariant = Color(0xFF13211B),
+    onSurface = Color(0xFFF0FAF4),
+    onSurfaceVariant = Color(0xFFAFC3B8),
+    outline = Color(0xFF5B6C63),
     error = Color(0xFFFFB4AB)
 )
 

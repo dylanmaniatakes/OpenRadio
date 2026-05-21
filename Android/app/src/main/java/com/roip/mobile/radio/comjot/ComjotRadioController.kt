@@ -9,9 +9,11 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.roip.mobile.radio.comjot.ComjotPacket.toHexString
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -50,15 +52,71 @@ class ComjotRadioController(
     @Volatile
     private var configuredControlSerialPath: String? = null
 
+    @Volatile
+    private var nativeControlSerial: ComjotNativeSerial? = null
+
+    @Volatile
+    private var controlSerialDescriptor: ParcelFileDescriptor? = null
+
+    @Volatile
+    private var controlInput: FileInputStream? = null
+
+    @Volatile
+    private var controlOutput: FileOutputStream? = null
+
+    @Volatile
+    private var transmitAudioFormat: ComjotTransmitAudioFormat = ComjotTransmitAudioFormat.DIGITAL_10MS
+
     fun programDigital(
         context: Context,
         profile: ComjotDigitalProfile,
         baudRate: Int
     ): ComjotWriteResult {
-        return writePacket(
+        transmitAudioFormat = ComjotTransmitAudioFormat.DIGITAL_10MS
+        prepareRfModuleForProgramming()
+        val versionResult = writePacket(
+            context = context,
+            packet = ComjotPacket.getVersion(),
+            baudRate = baudRate
+        )
+        if (versionResult !is ComjotWriteResult.Sent) {
+            return versionResult
+        }
+
+        Thread.sleep(PROFILE_AFTER_VERSION_DELAY_MS)
+        val groupResult = writePacket(
             context = context,
             packet = ComjotPacket.setDigitalGroup(profile),
             baudRate = baudRate
+        )
+        if (groupResult !is ComjotWriteResult.Sent) {
+            return groupResult
+        }
+
+        Thread.sleep(PROFILE_AFTER_GROUP_DELAY_MS)
+        val volumeResult = writePacket(
+            context = context,
+            packet = ComjotPacket.setVolume(profile.volume),
+            baudRate = baudRate
+        )
+        if (volumeResult !is ComjotWriteResult.Sent) {
+            return volumeResult
+        }
+
+        val micGainResult = writePacket(
+            context = context,
+            packet = ComjotPacket.setMicGain(profile.micGain),
+            baudRate = baudRate
+        )
+        if (micGainResult !is ComjotWriteResult.Sent) {
+            return micGainResult
+        }
+
+        return groupResult.copy(
+            bytesWritten = versionResult.bytesWritten +
+                groupResult.bytesWritten +
+                volumeResult.bytesWritten +
+                micGainResult.bytesWritten
         ).startReceiveAudioIfAvailable()
     }
 
@@ -67,10 +125,61 @@ class ComjotRadioController(
         profile: ComjotAnalogProfile,
         baudRate: Int
     ): ComjotWriteResult {
-        return writePacket(
+        transmitAudioFormat = ComjotTransmitAudioFormat.DIGITAL_10MS
+        prepareRfModuleForProgramming()
+        val versionResult = writePacket(
+            context = context,
+            packet = ComjotPacket.getVersion(),
+            baudRate = baudRate
+        )
+        if (versionResult !is ComjotWriteResult.Sent) {
+            return versionResult
+        }
+
+        Thread.sleep(PROFILE_AFTER_VERSION_DELAY_MS)
+        val groupResult = writePacket(
             context = context,
             packet = ComjotPacket.setAnalogGroup(profile),
             baudRate = baudRate
+        )
+        if (groupResult !is ComjotWriteResult.Sent) {
+            return groupResult
+        }
+
+        Thread.sleep(PROFILE_AFTER_GROUP_DELAY_MS)
+        val powerSaveResult = writePacket(
+            context = context,
+            packet = ComjotPacket.setPowerSave(enabled = false),
+            baudRate = baudRate
+        )
+        if (powerSaveResult !is ComjotWriteResult.Sent) {
+            return powerSaveResult
+        }
+
+        val micGainResult = writePacket(
+            context = context,
+            packet = ComjotPacket.setMicGain(profile.micGain),
+            baudRate = baudRate
+        )
+        if (micGainResult !is ComjotWriteResult.Sent) {
+            return micGainResult
+        }
+
+        val volumeResult = writePacket(
+            context = context,
+            packet = ComjotPacket.setVolume(profile.volume),
+            baudRate = baudRate
+        )
+        if (volumeResult !is ComjotWriteResult.Sent) {
+            return volumeResult
+        }
+
+        return groupResult.copy(
+            bytesWritten = versionResult.bytesWritten +
+                groupResult.bytesWritten +
+                powerSaveResult.bytesWritten +
+                micGainResult.bytesWritten +
+                volumeResult.bytesWritten
         ).startReceiveAudioIfAvailable()
     }
 
@@ -126,11 +235,32 @@ class ComjotRadioController(
         }
 
         return try {
-            audioBridge.startExternalTransmit()
+            audioBridge.startExternalTransmit(audioFormat = transmitAudioFormat)
             setHardwarePtt(active = true)
-            firstWrite.copy(
-                deviceName = "${firstWrite.deviceName} + RF bridge audio"
-            )
+
+            when (
+                val secondWrite = writePacket(
+                    context = context,
+                    packet = packet,
+                    baudRate = baudRate
+                )
+            ) {
+                is ComjotWriteResult.Sent -> secondWrite.copy(
+                    deviceName = "${secondWrite.deviceName} + RF bridge audio",
+                    bytesWritten = firstWrite.bytesWritten + secondWrite.bytesWritten
+                )
+
+                else -> {
+                    writePacket(
+                        context = context,
+                        packet = ComjotPacket.setTransmission(false),
+                        baudRate = baudRate
+                    )
+                    setHardwarePtt(active = false)
+                    audioBridge.stopTransmit()
+                    secondWrite
+                }
+            }
         } catch (error: Exception) {
             runCatching {
                 writePacket(
@@ -184,6 +314,10 @@ class ComjotRadioController(
         }.onFailure { error ->
             Log.w(TAG, "Failed to release CJ-1 hardware PTT during shutdown", error)
         }
+        synchronized(internalSerialLock) {
+            closeInternalControlSessionLocked()
+            rfModulePrepared = false
+        }
         audioBridge.shutdown()
     }
 
@@ -207,7 +341,8 @@ class ComjotRadioController(
         return try {
             audioBridge.startTransmit(
                 context = context.applicationContext,
-                onPcm = onTransmitPcm
+                onPcm = onTransmitPcm,
+                audioFormat = transmitAudioFormat
             )
             setHardwarePtt(active = true)
 
@@ -322,17 +457,40 @@ class ComjotRadioController(
         } ?: return ComjotWriteResult.NoDevice(packetHex)
 
         return try {
-            prepareInternalControlPath(serialPath)
-            FileOutputStream(serialPath).use { output ->
-                output.write(packet)
-                output.flush()
+            synchronized(internalSerialLock) {
+                prepareInternalControlPathLocked(serialPath)
+                drainInternalControlInputLocked(waitForBytesMs = 0L)
+                val nativeSerial = nativeControlSerial
+                val output = controlOutput
+                if (nativeSerial == null && output == null) {
+                    throw IOException("control output stream is not open")
+                }
+                Log.i(TAG, "CJ-1 control TX ${packet.size} bytes: ${packetHex.take(MAX_PACKET_LOG_HEX)}")
+                if (nativeSerial != null) {
+                    nativeSerial.write(packet)
+                } else {
+                    output?.write(packet)
+                    output?.flush()
+                }
+                Thread.sleep(INTERNAL_COMMAND_REPEAT_DELAY_MS)
+                if (nativeSerial != null) {
+                    nativeSerial.write(packet)
+                } else {
+                    output?.write(packet)
+                    output?.flush()
+                }
+                drainInternalControlInputLocked(waitForBytesMs = INTERNAL_RESPONSE_WAIT_MS)
             }
             ComjotWriteResult.Sent(
                 packetHex = packetHex,
                 deviceName = "CJ-1 internal UART $serialPath",
-                bytesWritten = packet.size
+                bytesWritten = packet.size * 2
             )
         } catch (error: Exception) {
+            synchronized(internalSerialLock) {
+                closeInternalControlSessionLocked()
+                rfModulePrepared = false
+            }
             ComjotWriteResult.Failed(
                 packetHex = packetHex,
                 message = "CJ-1 internal UART write failed on $serialPath: ${error.message ?: "unknown error"}"
@@ -340,16 +498,28 @@ class ComjotRadioController(
         }
     }
 
-    private fun prepareInternalControlPath(serialPath: String) {
-        synchronized(internalSerialLock) {
-            if (!rfModulePrepared) {
-                prepareRfModuleIfPresent()
-                rfModulePrepared = true
-            }
+    private fun prepareInternalControlPathLocked(serialPath: String) {
+        if (!rfModulePrepared) {
+            prepareRfModuleIfPresent(force = false)
+            rfModulePrepared = true
+        }
 
-            if (configuredControlSerialPath != serialPath) {
-                configureInternalSerial(serialPath)
-                configuredControlSerialPath = serialPath
+        ensureInternalControlSessionLocked(serialPath)
+    }
+
+    private fun prepareRfModuleForProgramming() {
+        synchronized(internalSerialLock) {
+            val serialPath = INTERNAL_CONTROL_PATHS.firstOrNull { path ->
+                File(path).let { it.exists() && it.canRead() && it.canWrite() }
+            }
+            if (serialPath != null) {
+                ensureInternalControlSessionLocked(serialPath)
+                drainInternalControlInputLocked(waitForBytesMs = 0L)
+            }
+            prepareRfModuleIfPresent(force = true)
+            rfModulePrepared = true
+            if (serialPath != null) {
+                drainInternalControlInputLocked(waitForBytesMs = RF_POWER_RESPONSE_WAIT_MS)
             }
         }
     }
@@ -373,14 +543,26 @@ class ComjotRadioController(
         }
     }
 
-    private fun prepareRfModuleIfPresent() {
+    private fun prepareRfModuleIfPresent(force: Boolean) {
         if (!File(AUCTUS_CONTROL_PATH).exists() && !File(DMR_POWER_PATH).exists()) {
             return
+        }
+
+        if (force) {
+            runCatching {
+                setHardwarePtt(active = false)
+            }
+            writeSysfs(AUCTUS_CONTROL_PATH, "4")
+            writeSysfs(AUCTUS_CONTROL_PATH, "0")
+            writeSysfs(DMR_POWER_PATH, "0")
+            Thread.sleep(RF_POWER_RESET_SETTLE_MS)
         }
 
         writeSysfs(AUCTUS_CONTROL_PATH, "0")
         writeSysfs(DMR_POWER_PATH, "1")
         writeSysfs(AUCTUS_CONTROL_PATH, "1")
+        Log.i(TAG, "CJ-1 RF module power sequence applied${if (force) " for profile programming" else ""}")
+        Thread.sleep(RF_POWER_SETTLE_MS)
     }
 
     private fun setHardwarePtt(active: Boolean) {
@@ -426,6 +608,162 @@ class ComjotRadioController(
             val details = output.ifBlank { "exit ${process.exitValue()}" }
             throw IOException("stty failed: $details")
         }
+    }
+
+    private fun ensureInternalControlSessionLocked(serialPath: String) {
+        if (
+            configuredControlSerialPath == serialPath &&
+            (
+                nativeControlSerial != null ||
+                    (controlInput != null && controlOutput != null)
+                )
+        ) {
+            return
+        }
+
+        closeInternalControlSessionLocked()
+
+        if (ComjotNativeSerial.isAvailable) {
+            runCatching {
+                val nativeSerial = ComjotNativeSerial.open(serialPath, INTERNAL_CONTROL_BAUD)
+                nativeControlSerial = nativeSerial
+                configuredControlSerialPath = serialPath
+                Log.i(
+                    TAG,
+                    "CJ-1 control serial session opened on $serialPath with native fd " +
+                        "at ${nativeSerial.configuredBaud} baud"
+                )
+                return
+            }.onFailure { nativeError ->
+                Log.w(TAG, "Native serial open failed for $serialPath; falling back to Java streams", nativeError)
+            }
+        }
+
+        configureInternalSerial(serialPath)
+
+        val serialFile = File(serialPath)
+        runCatching {
+            val descriptor = ParcelFileDescriptor.open(
+                serialFile,
+                ParcelFileDescriptor.MODE_READ_WRITE
+            )
+            controlSerialDescriptor = descriptor
+            controlInput = FileInputStream(descriptor.fileDescriptor)
+            controlOutput = FileOutputStream(descriptor.fileDescriptor)
+            configuredControlSerialPath = serialPath
+            Log.i(TAG, "CJ-1 control serial session opened on $serialPath with shared descriptor")
+        }.onFailure { descriptorError ->
+            Log.w(
+                TAG,
+                "Shared descriptor open failed for $serialPath; falling back to persistent split streams",
+                descriptorError
+            )
+            controlInput = FileInputStream(serialFile)
+            controlOutput = FileOutputStream(serialFile)
+            configuredControlSerialPath = serialPath
+            Log.i(TAG, "CJ-1 control serial session opened on $serialPath with split streams")
+        }
+    }
+
+    private fun closeInternalControlSessionLocked() {
+        val oldPath = configuredControlSerialPath
+        runCatching {
+            nativeControlSerial?.close()
+        }
+        runCatching {
+            controlOutput?.flush()
+        }
+        runCatching {
+            controlInput?.close()
+        }
+        runCatching {
+            controlOutput?.close()
+        }
+        runCatching {
+            controlSerialDescriptor?.close()
+        }
+        nativeControlSerial = null
+        controlInput = null
+        controlOutput = null
+        controlSerialDescriptor = null
+        configuredControlSerialPath = null
+        if (oldPath != null) {
+            Log.i(TAG, "CJ-1 control serial session closed on $oldPath")
+        }
+    }
+
+    private fun drainInternalControlInputLocked(waitForBytesMs: Long) {
+        runCatching {
+            val buffer = ByteArray(INTERNAL_CONTROL_DRAIN_BYTES)
+            val captured = ByteArray(INTERNAL_CONTROL_DRAIN_BYTES)
+            var total = 0
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(waitForBytesMs)
+
+            do {
+                val nativeSerial = nativeControlSerial
+                val input = controlInput
+                if (nativeSerial == null && input == null) {
+                    break
+                }
+
+                val nativeBytes = nativeSerial?.readAvailable(buffer.size)
+                val available = nativeBytes?.size ?: input?.available() ?: 0
+                if (available <= 0) {
+                    if (waitForBytesMs <= 0L || System.nanoTime() >= deadline) {
+                        break
+                    }
+                    Thread.sleep(INTERNAL_RESPONSE_POLL_DELAY_MS)
+                    continue
+                }
+
+                val count = if (nativeBytes != null) {
+                    nativeBytes.copyInto(buffer, endIndex = nativeBytes.size)
+                    nativeBytes.size
+                } else {
+                    input?.read(buffer, 0, minOf(available, buffer.size)) ?: 0
+                }
+                if (count <= 0) {
+                    break
+                }
+                val copyCount = minOf(count, captured.size - total)
+                if (copyCount > 0) {
+                    buffer.copyInto(
+                        destination = captured,
+                        destinationOffset = total,
+                        startIndex = 0,
+                        endIndex = copyCount
+                    )
+                }
+                total += count
+            } while (hasInternalControlBytesLocked() || (waitForBytesMs > 0L && System.nanoTime() < deadline))
+
+            if (total > 0) {
+                val received = captured.copyOf(minOf(total, captured.size))
+                Log.i(TAG, "CJ-1 control RX $total bytes: ${received.toHexString()}")
+                ComjotPacket.parseFrames(received).forEach { frame ->
+                    Log.i(
+                        TAG,
+                        "CJ-1 control frame cmd=0x${frame.command.toString(16)} " +
+                            "mode=0x${frame.mode.toString(16)} status=0x${frame.status.toString(16)} " +
+                            "payload=${frame.payload.toHexString()}"
+                    )
+                }
+            }
+        }.onFailure { error ->
+            Log.d(TAG, "Unable to drain CJ-1 control UART", error)
+            closeInternalControlSessionLocked()
+        }
+    }
+
+    private fun hasInternalControlBytesLocked(): Boolean {
+        return runCatching {
+            val nativeSerial = nativeControlSerial
+            if (nativeSerial != null) {
+                nativeSerial.available() > 0
+            } else {
+                (controlInput?.available() ?: 0) > 0
+            }
+        }.getOrDefault(false)
     }
 
     private fun permissionIntent(context: Context): PendingIntent {
@@ -586,6 +924,16 @@ class ComjotRadioController(
         private const val TAG = "ComjotRadio"
         private const val USB_TIMEOUT_MS = 1_000
         private const val INTERNAL_CONTROL_BAUD = 57_600
+        private const val INTERNAL_COMMAND_REPEAT_DELAY_MS = 10L
+        private const val INTERNAL_RESPONSE_WAIT_MS = 120L
+        private const val RF_POWER_RESPONSE_WAIT_MS = 800L
+        private const val INTERNAL_RESPONSE_POLL_DELAY_MS = 10L
+        private const val INTERNAL_CONTROL_DRAIN_BYTES = 1_024
+        private const val PROFILE_AFTER_VERSION_DELAY_MS = 300L
+        private const val PROFILE_AFTER_GROUP_DELAY_MS = 100L
+        private const val RF_POWER_RESET_SETTLE_MS = 150L
+        private const val RF_POWER_SETTLE_MS = 5_000L
+        private const val MAX_PACKET_LOG_HEX = 180
         private const val AUCTUS_CONTROL_PATH = "/sys/bus/platform/drivers/dmr_gpio/auctusctl"
         private const val DMR_POWER_PATH = "/sys/bus/platform/drivers/dmr_gpio/dmr_pwr"
         private const val DMR_PTT_PATH = "/sys/devices/platform/dmr_gpio/dmrptt"

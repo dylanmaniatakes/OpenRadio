@@ -125,9 +125,18 @@ internal class DmrNetworkAudioPlayer(
         }
         audioTrack = track
 
+        var primedFrames = 0
         try {
             while (running.get()) {
-                val ambe = queue.poll(250, TimeUnit.MILLISECONDS) ?: continue
+                val ambe = queue.poll(RX_IDLE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                if (ambe == null) {
+                    if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                        runCatching { track.pause() }
+                        runCatching { track.flush() }
+                        primedFrames = 0
+                    }
+                    continue
+                }
                 val pcm = decoder.decode2450x1150(ambe)
                 if (pcm == null || pcm.isEmpty()) {
                     droppedAmbeFrames.incrementAndGet()
@@ -135,13 +144,16 @@ internal class DmrNetworkAudioPlayer(
                 }
 
                 val written = track.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
-                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                    track.play()
-                }
                 if (written < 0) {
                     lastError = "AudioTrack write returned $written"
                     Log.w(TAG, "AudioTrack write returned $written")
                     continue
+                }
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    primedFrames += 1
+                    if (primedFrames >= RX_PREFILL_PCM_FRAMES) {
+                        track.play()
+                    }
                 }
 
                 val decoded = decodedPcmFrames.incrementAndGet()
@@ -216,7 +228,9 @@ internal class DmrNetworkAudioPlayer(
         private const val SAMPLE_RATE_HZ = 8_000
         private const val AMBE_FRAME_BYTES = 9
         private const val QUEUE_DEPTH = 180
-        private const val RX_BUFFER_BYTES = 8_000
+        private const val RX_BUFFER_BYTES = 24_000
+        private const val RX_PREFILL_PCM_FRAMES = 4
+        private const val RX_IDLE_TIMEOUT_MS = 180L
         private const val LOG_FRAME_INTERVAL = 100L
     }
 }

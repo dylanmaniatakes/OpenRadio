@@ -445,7 +445,7 @@ class DirectDmrRoipController(
         if (identity == null) {
             startIdentityLookup(frame.sourceId)
         }
-        synchronized(lock) {
+        val nextFrameCount = synchronized(lock) {
             val current = session ?: return
             val nextFrames = current.inboundDmrFrames + 1
             val newWarning = if (frame.isVoicePayload && !audioState.decoderAvailable) {
@@ -471,9 +471,12 @@ class DirectDmrRoipController(
                 lastInboundFrameType = frame.frameType,
                 audioDecoderState = audioState.status(frame.ambeFrameCount)
             )
+            nextFrames
         }
 
-        Log.i(TAG, "Received DMRD frame src=${frame.sourceId} dst=${frame.targetId} slot=${frame.slot} stream=${frame.streamId} frame=${frame.frameNumber} type=${frame.frameType} ambe=${frame.ambeFrameCount} flags=${frame.flags} count=${session?.inboundDmrFrames ?: 0}")
+        if (nextFrameCount <= 3 || nextFrameCount % RX_FRAME_LOG_INTERVAL == 0) {
+            Log.i(TAG, "Received DMRD frame src=${frame.sourceId} dst=${frame.targetId} slot=${frame.slot} stream=${frame.streamId} frame=${frame.frameNumber} type=${frame.frameType} ambe=${frame.ambeFrameCount} flags=${frame.flags} count=$nextFrameCount")
+        }
     }
 
     private fun startIdentityLookup(sourceId: Int) {
@@ -899,6 +902,7 @@ class DirectDmrRoipController(
         private const val DMR_VOICE_FRAME_MS = 60L
         private const val DMR_VOICE_SYNC_INTERVAL = 6
         private const val TX_LOG_INTERVAL = 20L
+        private const val RX_FRAME_LOG_INTERVAL = 100
         private const val DMRD_PACKET_BYTES = 55
         private const val TAG = "DirectDmr"
     }

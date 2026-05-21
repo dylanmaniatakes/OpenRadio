@@ -2,6 +2,7 @@ package com.roip.mobile
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.location.Location
@@ -9,10 +10,13 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Looper
+import android.provider.Settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.core.content.FileProvider
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
@@ -21,12 +25,16 @@ import com.roip.mobile.data.AccentColor
 import com.roip.mobile.data.COMJOT_CTCSS_CODES
 import com.roip.mobile.data.COMJOT_DCS_CODES
 import com.roip.mobile.data.BackendClient
+import com.roip.mobile.data.CallerLookup
+import com.roip.mobile.data.CallsignLookupClient
 import com.roip.mobile.data.ComjotBandwidth
 import com.roip.mobile.data.ComjotField
 import com.roip.mobile.data.ComjotMode
 import com.roip.mobile.data.ComjotProfile
 import com.roip.mobile.data.ComjotRfPower
 import com.roip.mobile.data.ComjotToneMode
+import com.roip.mobile.data.HardwareButtonAction
+import com.roip.mobile.data.HardwareButtonInput
 import com.roip.mobile.data.HotspotField
 import com.roip.mobile.data.HotspotProfile
 import com.roip.mobile.data.KnobControlMode
@@ -34,7 +42,11 @@ import com.roip.mobile.data.MemoryType
 import com.roip.mobile.data.ProviderField
 import com.roip.mobile.data.ProviderProfile
 import com.roip.mobile.data.RadioMemory
+import com.roip.mobile.data.ReleaseUpdateClient
 import com.roip.mobile.data.RoipOperationMode
+import com.roip.mobile.data.normalizedCallsign
+import com.roip.mobile.data.qrzLookupUrl
+import com.roip.mobile.data.qthLookupUrl
 import com.roip.mobile.radio.roip.AllStarIaxRoipController
 import com.roip.mobile.radio.comjot.ComjotAnalogProfile
 import com.roip.mobile.radio.comjot.ComjotDigitalProfile
@@ -63,6 +75,11 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 
 class MainViewModel(
     private val backendClient: BackendClient = BackendClient(),
+    private val callsignLookupClient: CallsignLookupClient = CallsignLookupClient(),
+    private val releaseUpdateClient: ReleaseUpdateClient = ReleaseUpdateClient(
+        owner = BuildConfig.GITHUB_OWNER,
+        repo = BuildConfig.GITHUB_REPO
+    ),
     private val comjotController: ComjotRadioController = ComjotRadioController(),
     private val directRoipController: DirectDmrRoipController = DirectDmrRoipController(),
     private val allStarIaxController: AllStarIaxRoipController = AllStarIaxRoipController()
@@ -74,6 +91,8 @@ class MainViewModel(
     private var comjotPttJob: Job? = null
     private var relayPttJob: Job? = null
     private var hotspotPttJob: Job? = null
+    private var callerLookupJob: Job? = null
+    private var updateJob: Job? = null
     private var hotspotRfReleaseJob: Job? = null
     private var hotspotNetworkReleaseJob: Job? = null
     private var persistJob: Job? = null
@@ -91,6 +110,8 @@ class MainViewModel(
         val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val savedVolume = prefs.getString(KEY_VOLUME, null)
         val shouldMigrateRadioVolumeDefault = !prefs.getBoolean(KEY_RADIO_VOLUME_DEFAULT_MIGRATED, false)
+        val savedMicGain = prefs.getString(KEY_MIC_GAIN, null)
+        val shouldMigrateMicGainDefault = !prefs.getBoolean(KEY_MIC_GAIN_DEFAULT_MIGRATED, false)
         val savedHotspotSoftware = prefs.getString(KEY_HOTSPOT_SOFTWARE, null)
         val savedHotspotPackageId = prefs.getString(KEY_HOTSPOT_PACKAGE_ID, null)
         val savedHotspotSlotFlags = prefs.getString(KEY_HOTSPOT_SLOT_FLAGS, null)
@@ -104,6 +125,13 @@ class MainViewModel(
             }
             savedVolume != null -> savedVolume
             else -> DEFAULT_RADIO_VOLUME
+        }
+        val loadedMicGain = when {
+            shouldMigrateMicGainDefault && (savedMicGain == null || savedMicGain in LEGACY_MIC_GAIN_DEFAULTS) -> {
+                DEFAULT_MIC_GAIN
+            }
+            savedMicGain != null -> savedMicGain
+            else -> DEFAULT_MIC_GAIN
         }
 
         _uiState.update { current ->
@@ -124,7 +152,7 @@ class MainViewModel(
                 txToneCode = prefs.getString(KEY_TX_TONE_CODE, currentProfile.txToneCode) ?: currentProfile.txToneCode,
                 rfPower = prefs.getEnum(KEY_RF_POWER, ComjotRfPower.entries, currentProfile.rfPower),
                 volume = loadedRadioVolume,
-                micGain = prefs.getString(KEY_MIC_GAIN, currentProfile.micGain) ?: currentProfile.micGain,
+                micGain = loadedMicGain,
                 repeaterDecoupling = prefs.getBoolean(KEY_REPEATER_DECOUPLING, currentProfile.repeaterDecoupling),
                 baudRate = prefs.getString(KEY_BAUD_RATE, currentProfile.baudRate) ?: currentProfile.baudRate
             ).let { profile ->
@@ -152,6 +180,9 @@ class MainViewModel(
                 memories = loadMemories(prefs),
                 selectedMemoryId = prefs.getString(KEY_SELECTED_MEMORY_ID, current.selectedMemoryId),
                 knobControlMode = prefs.getEnum(KEY_KNOB_CONTROL_MODE, KnobControlMode.entries, current.knobControlMode),
+                hardwareButtonMappings = parseHardwareButtonMappings(
+                    prefs.getString(KEY_HARDWARE_BUTTON_MAPPINGS, null)
+                ),
                 accentColor = prefs.getEnum(KEY_ACCENT_COLOR, AccentColor.entries, current.accentColor),
                 roipOperationMode = if (radioHardwareAvailable) {
                     prefs.getEnum(KEY_ROIP_OPERATION_MODE, RoipOperationMode.entries, current.roipOperationMode)
@@ -176,6 +207,7 @@ class MainViewModel(
 
         if (
             shouldMigrateRadioVolumeDefault ||
+            shouldMigrateMicGainDefault ||
             shouldMigrateHotspotSoftwareIdDefault ||
             shouldMigrateHotspotPackageIdDefault ||
             shouldMigrateHotspotSlotFlagsDefault
@@ -185,6 +217,11 @@ class MainViewModel(
                 editor
                     .putString(KEY_VOLUME, loadedRadioVolume)
                     .putBoolean(KEY_RADIO_VOLUME_DEFAULT_MIGRATED, true)
+            }
+            if (shouldMigrateMicGainDefault) {
+                editor
+                    .putString(KEY_MIC_GAIN, loadedMicGain)
+                    .putBoolean(KEY_MIC_GAIN_DEFAULT_MIGRATED, true)
             }
             if (shouldMigrateHotspotSoftwareIdDefault) {
                 val softwareId = if (savedHotspotSoftware.shouldUseDefaultHotspotSoftwareId()) {
@@ -421,6 +458,81 @@ class MainViewModel(
         persistNow()
     }
 
+    fun updateHardwareButtonMapping(inputName: String, actionName: String) {
+        val input = enumByName(
+            entries = HardwareButtonInput.entries,
+            name = inputName,
+            fallback = HardwareButtonInput.PTT
+        )
+        val action = enumByName(
+            entries = HardwareButtonAction.entries,
+            name = actionName,
+            fallback = HardwareButtonAction.DEFAULT
+        )
+        _uiState.update { current ->
+            val mappings = current.hardwareButtonMappings.toMutableMap()
+            if (action == HardwareButtonAction.DEFAULT) {
+                mappings.remove(input)
+            } else {
+                mappings[input] = action
+            }
+            current.copy(
+                hardwareButtonMappings = mappings.toMap(),
+                lastSyncLabel = "${input.title} maps to ${action.title}"
+            )
+        }
+        persistNow()
+    }
+
+    fun hardwareButtonActionFor(input: HardwareButtonInput): HardwareButtonAction {
+        return _uiState.value.hardwareButtonMappings[input] ?: HardwareButtonAction.DEFAULT
+    }
+
+    fun handleMappedHardwareButton(
+        context: Context,
+        inputName: String,
+        actionName: String,
+        pressed: Boolean,
+        source: String
+    ) {
+        val input = enumByName(HardwareButtonInput.entries, inputName, HardwareButtonInput.PTT)
+        val action = enumByName(HardwareButtonAction.entries, actionName, HardwareButtonAction.DEFAULT)
+        val label = "${input.title} from $source"
+
+        if (!action.momentary && !pressed) {
+            return
+        }
+
+        when (action) {
+            HardwareButtonAction.DEFAULT -> handleHardwarePtt(context, pressed, source)
+            HardwareButtonAction.DISABLED -> {
+                if (pressed) {
+                    _uiState.update { current ->
+                        current.copy(errorMessage = null, lastSyncLabel = "$label ignored")
+                    }
+                }
+            }
+            HardwareButtonAction.CONTEXT_PTT -> handleHardwarePtt(context, pressed, source)
+            HardwareButtonAction.NETWORK_PTT -> setRelayPtt(pressed)
+            HardwareButtonAction.RADIO_PTT -> setComjotPtt(context, pressed)
+            HardwareButtonAction.HOTSPOT_PTT -> setHotspotPtt(pressed)
+            HardwareButtonAction.TOGGLE_NETWORK_PTT -> togglePtt()
+            HardwareButtonAction.TOGGLE_RADIO_PTT -> toggleComjotPtt(context)
+            HardwareButtonAction.CONNECT_ROIP -> connectSelectedRoipProvider()
+            HardwareButtonAction.DISCONNECT_ROIP -> disconnect()
+            HardwareButtonAction.NEXT_MODE -> stepComjotMode(1, label)
+            HardwareButtonAction.PREVIOUS_MODE -> stepComjotMode(-1, label)
+            HardwareButtonAction.NEXT_MEMORY -> stepKnobMemory(1, label)
+            HardwareButtonAction.PREVIOUS_MEMORY -> stepKnobMemory(-1, label)
+            HardwareButtonAction.TUNE_UP -> adjustKnobFrequency(1, label)
+            HardwareButtonAction.TUNE_DOWN -> adjustKnobFrequency(-1, label)
+            HardwareButtonAction.VOLUME_UP -> adjustKnobVolume(context, 1, label)
+            HardwareButtonAction.VOLUME_DOWN -> adjustKnobVolume(context, -1, label)
+            HardwareButtonAction.KNOB_UP -> handleKnobRotation(context, direction = 1, steps = 1, source = label)
+            HardwareButtonAction.KNOB_DOWN -> handleKnobRotation(context, direction = -1, steps = 1, source = label)
+        }
+    }
+
     fun updateAccentColor(value: String) {
         _uiState.update { current ->
             current.copy(
@@ -433,6 +545,55 @@ class MainViewModel(
             )
         }
         persistNow()
+    }
+
+    fun lookupCallerDetails(callsign: String?) {
+        val normalized = callsign?.normalizedCallsign()
+        if (normalized == null) {
+            callerLookupJob?.cancel()
+            callerLookupJob = null
+            _uiState.update { current ->
+                if (current.callerLookup == null) current else current.copy(callerLookup = null)
+            }
+            return
+        }
+
+        val existing = _uiState.value.callerLookup
+        if (existing?.callsign == normalized && (existing.loading || existing.error == null)) {
+            return
+        }
+
+        callerLookupJob?.cancel()
+        _uiState.update { current ->
+            current.copy(
+                callerLookup = CallerLookup(
+                    callsign = normalized,
+                    qrzUrl = normalized.qrzLookupUrl(),
+                    qthUrl = normalized.qthLookupUrl(),
+                    loading = true
+                )
+            )
+        }
+        callerLookupJob = viewModelScope.launch {
+            runCatching {
+                callsignLookupClient.lookup(normalized)
+            }.onSuccess { lookup ->
+                _uiState.update { current ->
+                    current.copy(callerLookup = lookup)
+                }
+            }.onFailure { error ->
+                _uiState.update { current ->
+                    current.copy(
+                        callerLookup = CallerLookup(
+                            callsign = normalized,
+                            qrzUrl = normalized.qrzLookupUrl(),
+                            qthUrl = normalized.qthLookupUrl(),
+                            error = error.message ?: "Callsign lookup failed"
+                        )
+                    )
+                }
+            }
+        }
     }
 
     fun updateRoipOperationMode(value: String) {
@@ -967,6 +1128,144 @@ class MainViewModel(
         }
     }
 
+    fun checkForGithubUpdate(context: Context) {
+        val applicationContext = context.applicationContext
+        appContext = applicationContext
+        if (updateJob?.isActive == true) {
+            _uiState.update { current ->
+                current.copy(
+                    updateStatus = "Update check already running",
+                    lastSyncLabel = "Update check already running"
+                )
+            }
+            return
+        }
+
+        updateJob = viewModelScope.launch {
+            _uiState.update { current ->
+                current.copy(
+                    updateInProgress = true,
+                    updateStatus = "Checking GitHub releases...",
+                    errorMessage = null,
+                    lastSyncLabel = "Checking GitHub releases"
+                )
+            }
+
+            val releaseResult = runCatching {
+                releaseUpdateClient.findNewerRelease(BuildConfig.VERSION_NAME)
+            }.onFailure { error ->
+                _uiState.update { current ->
+                    current.copy(
+                        updateInProgress = false,
+                        updateStatus = "Update check failed",
+                        errorMessage = error.message ?: "Unable to check GitHub releases",
+                        lastSyncLabel = "GitHub update check failed"
+                    )
+                }
+            }
+            if (releaseResult.isFailure) {
+                return@launch
+            }
+            val release = releaseResult.getOrNull()
+
+            if (release == null) {
+                _uiState.update { current ->
+                    current.copy(
+                        updateInProgress = false,
+                        updateStatus = "${BuildConfig.VERSION_NAME} is current",
+                        errorMessage = null,
+                        lastSyncLabel = "No newer GitHub release found"
+                    )
+                }
+                return@launch
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                !applicationContext.packageManager.canRequestPackageInstalls()
+            ) {
+                runCatching { openUnknownAppInstallSettings(applicationContext) }
+                _uiState.update { current ->
+                    current.copy(
+                        updateInProgress = false,
+                        updateStatus = "Allow OpenRadio to install APKs, then check again",
+                        errorMessage = null,
+                        lastSyncLabel = "Install permission needed"
+                    )
+                }
+                return@launch
+            }
+
+            _uiState.update { current ->
+                current.copy(
+                    updateStatus = "Downloading ${release.versionLabel}...",
+                    errorMessage = null,
+                    lastSyncLabel = "Downloading update"
+                )
+            }
+
+            runCatching {
+                val apk = releaseUpdateClient.downloadApk(applicationContext, release)
+                openApkInstaller(applicationContext, apk)
+                release
+            }.onSuccess { installedRelease ->
+                _uiState.update { current ->
+                    current.copy(
+                        updateInProgress = false,
+                        updateStatus = "Installer opened for ${installedRelease.versionLabel}",
+                        errorMessage = null,
+                        lastSyncLabel = "GitHub update ready to install"
+                    )
+                }
+            }.onFailure { error ->
+                _uiState.update { current ->
+                    current.copy(
+                        updateInProgress = false,
+                        updateStatus = "Update install failed",
+                        errorMessage = error.message ?: "Unable to download or install update",
+                        lastSyncLabel = "GitHub update failed"
+                    )
+                }
+            }
+        }
+    }
+
+    private fun openUnknownAppInstallSettings(context: Context) {
+        val intent = Intent(
+            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+            Uri.parse("package:${context.packageName}")
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+    }
+
+    private fun openApkInstaller(context: Context, apk: File) {
+        val apkUri = FileProvider.getUriForFile(
+            context,
+            "${BuildConfig.APPLICATION_ID}.fileprovider",
+            apk
+        )
+        val installIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(apkUri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+        }
+
+        val installers = context.packageManager.queryIntentActivities(
+            installIntent,
+            PackageManager.MATCH_DEFAULT_ONLY
+        )
+        installers.forEach { installer ->
+            context.grantUriPermission(
+                installer.activityInfo.packageName,
+                apkUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+        if (installers.isEmpty()) {
+            throw IllegalStateException("No Android APK installer is available")
+        }
+        context.startActivity(installIntent)
+    }
+
     fun onVersionTapped() {
         if (_uiState.value.comjot.developerMode) {
             _uiState.update { current ->
@@ -1112,7 +1411,11 @@ class MainViewModel(
 
     fun connect(providerId: String) {
         val snapshot = _uiState.value
-        if (snapshot.activeSession != null) {
+        if (snapshot.activeSession?.phase == "disconnected") {
+            _uiState.update { current ->
+                current.copy(activeSession = null, errorMessage = snapshot.activeSession.statusMessage)
+            }
+        } else if (snapshot.activeSession != null) {
             _uiState.update { current ->
                 current.copy(lastSyncLabel = "Disconnect current ROIP session first")
             }
@@ -1463,6 +1766,32 @@ class MainViewModel(
         }
     }
 
+    private fun connectSelectedRoipProvider() {
+        val provider = _uiState.value.selectedRoipProvider()
+        if (provider == null) {
+            _uiState.update { current ->
+                current.copy(lastSyncLabel = "No ROIP provider selected")
+            }
+            return
+        }
+        connect(provider.type.providerId)
+    }
+
+    private fun stepComjotMode(delta: Int, source: String) {
+        val snapshot = _uiState.value
+        val modes = if (snapshot.radioHardwareAvailable) {
+            ComjotMode.entries
+        } else {
+            listOf(ComjotMode.ROIP)
+        }
+        val currentIndex = modes.indexOf(snapshot.comjot.profile.mode).takeIf { it >= 0 } ?: 0
+        val nextMode = modes[Math.floorMod(currentIndex + delta, modes.size)]
+        updateComjot(ComjotField.MODE, nextMode.name)
+        _uiState.update { current ->
+            current.copy(lastSyncLabel = "${nextMode.titleFor(current.comjot.developerMode)} from $source")
+        }
+    }
+
     private fun startPolling(sessionId: String) {
         pollJob?.cancel()
         pollJob = viewModelScope.launch {
@@ -1500,16 +1829,20 @@ class MainViewModel(
                     else -> null
                 }
                 if (updated != null) {
+                    val disconnected = updated.phase == "disconnected"
                     _uiState.update { current ->
                         current.copy(
-                            activeSession = updated,
-                            errorMessage = if (updated.phase == "disconnected") updated.statusMessage else null,
-                            lastSyncLabel = if (updated.phase == "disconnected") {
+                            activeSession = if (disconnected) null else updated,
+                            errorMessage = if (disconnected) updated.statusMessage else null,
+                            lastSyncLabel = if (disconnected) {
                                 "${updated.providerName} disconnected"
                             } else {
                                 "${updated.providerName} active"
                             }
                         )
+                    }
+                    if (disconnected) {
+                        break
                     }
                 }
 
@@ -1525,7 +1858,13 @@ class MainViewModel(
             }
         }
 
-        val rxStarted = comjotController.startHotspotReceiveAudio(
+        if (!startCj1HotspotReceiveBridge()) {
+            throw IllegalStateException("CJ-1 RF audio bridge is not available on this device")
+        }
+    }
+
+    private fun startCj1HotspotReceiveBridge(): Boolean {
+        return comjotController.startHotspotReceiveAudio(
             onPcm = { pcm ->
                 viewModelScope.launch(Dispatchers.IO) {
                     forwardRfAudioToAllStar(pcm)
@@ -1533,9 +1872,6 @@ class MainViewModel(
             },
             playLocalMonitor = false
         )
-        if (!rxStarted) {
-            throw IllegalStateException("CJ-1 RF audio bridge is not available on this device")
-        }
     }
 
     private suspend fun forwardNetworkAudioToRf(context: Context, baudRate: Int, pcm: ShortArray) {
@@ -1560,6 +1896,12 @@ class MainViewModel(
                     comjotController.stopHotspotTransmitAudio(context, baudRate)
                 }
                 hotspotRfTxActive = false
+                if (!startCj1HotspotReceiveBridge()) {
+                    _uiState.update { current ->
+                        current.copy(lastSyncLabel = "CJ-1 RF receive bridge unavailable")
+                    }
+                    return@launch
+                }
                 _uiState.update { current ->
                     current.copy(lastSyncLabel = "AllStar RF downlink idle")
                 }
@@ -1712,6 +2054,7 @@ class MainViewModel(
             .putString(KEY_MEMORIES, serializeMemories(state.memories))
             .putString(KEY_SELECTED_MEMORY_ID, state.selectedMemoryId)
             .putString(KEY_KNOB_CONTROL_MODE, state.knobControlMode.name)
+            .putString(KEY_HARDWARE_BUTTON_MAPPINGS, serializeHardwareButtonMappings(state.hardwareButtonMappings))
             .putString(KEY_ACCENT_COLOR, state.accentColor.name)
             .putString(KEY_ROIP_OPERATION_MODE, state.roipOperationMode.name)
             .putString(KEY_SELECTED_ROIP_PROVIDER_ID, state.selectedRoipProviderId)
@@ -1962,7 +2305,7 @@ class MainViewModel(
                             txToneCode = obj.optString("txToneCode", "None"),
                             rfPower = enumByName(ComjotRfPower.entries, obj.optString("rfPower"), ComjotRfPower.HIGH),
                             volume = obj.optString("volume", DEFAULT_RADIO_VOLUME),
-                            micGain = obj.optString("micGain", "0"),
+                            micGain = obj.optString("micGain", DEFAULT_MIC_GAIN),
                             repeaterDecoupling = obj.optBoolean("repeaterDecoupling", false),
                             providerId = obj.optionalString("providerId"),
                             providerTitle = obj.optionalString("providerTitle"),
@@ -2007,6 +2350,36 @@ class MainViewModel(
             array.put(obj)
         }
         return array.toString()
+    }
+
+    private fun parseHardwareButtonMappings(raw: String?): Map<HardwareButtonInput, HardwareButtonAction> {
+        if (raw.isNullOrBlank()) {
+            return emptyMap()
+        }
+        return raw.split(";")
+            .mapNotNull { entry ->
+                val parts = entry.split(":", limit = 2)
+                if (parts.size != 2) {
+                    return@mapNotNull null
+                }
+                val input = HardwareButtonInput.entries.firstOrNull { it.name == parts[0] } ?: return@mapNotNull null
+                val action = HardwareButtonAction.entries.firstOrNull { it.name == parts[1] } ?: return@mapNotNull null
+                if (action == HardwareButtonAction.DEFAULT) {
+                    null
+                } else {
+                    input to action
+                }
+            }
+            .toMap()
+    }
+
+    private fun serializeHardwareButtonMappings(
+        mappings: Map<HardwareButtonInput, HardwareButtonAction>
+    ): String {
+        return mappings.entries
+            .filter { it.value != HardwareButtonAction.DEFAULT }
+            .sortedBy { it.key.ordinal }
+            .joinToString(";") { "${it.key.name}:${it.value.name}" }
     }
 
     private fun JSONObject.optionalString(key: String): String? {
@@ -2073,8 +2446,9 @@ class MainViewModel(
             rxSubcode = parseToneSubcode(rxToneMode, rxToneCode, "RX tone"),
             txToneMode = if (scanner) ComjotToneMode.OFF.protocolValue else txToneMode.protocolValue,
             txSubcode = if (scanner) 0 else parseToneSubcode(txToneMode, txToneCode, "TX tone"),
-            powerSave = true,
+            powerSave = false,
             volume = parseBoundedInt(volume, "Radio volume", 1, 9),
+            micGain = parseBoundedInt(micGain, "Mic gain", 0, 5),
             monitorOpen = scanner,
             repeaterDecoupling = repeaterDecoupling
         )
@@ -2342,12 +2716,16 @@ class MainViewModel(
         private const val KEY_VOLUME = "comjot.volume"
         private const val KEY_RADIO_VOLUME_DEFAULT_MIGRATED = "comjot.volume_default_migrated_v2"
         private const val KEY_MIC_GAIN = "comjot.mic_gain"
+        private const val KEY_MIC_GAIN_DEFAULT_MIGRATED = "comjot.mic_gain_default_migrated_v3"
+        private const val DEFAULT_MIC_GAIN = "3"
+        private val LEGACY_MIC_GAIN_DEFAULTS = setOf("0", "2")
         private const val KEY_REPEATER_DECOUPLING = "comjot.repeater_decoupling"
         private const val KEY_BAUD_RATE = "comjot.baud_rate"
         private const val KEY_DEVELOPER_MODE = "developer_mode"
         private const val KEY_MEMORIES = "memories"
         private const val KEY_SELECTED_MEMORY_ID = "selected_memory_id"
         private const val KEY_KNOB_CONTROL_MODE = "knob_control_mode"
+        private const val KEY_HARDWARE_BUTTON_MAPPINGS = "hardware_button_mappings"
         private const val KEY_ACCENT_COLOR = "accent_color"
         private const val KEY_ROIP_OPERATION_MODE = "roip_operation_mode"
         private const val KEY_SELECTED_ROIP_PROVIDER_ID = "selected_roip_provider_id"

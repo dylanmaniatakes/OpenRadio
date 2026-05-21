@@ -51,6 +51,49 @@ enum class KnobControlMode(val title: String) {
     MEMORIES("Memories")
 }
 
+enum class HardwareButtonInput(val title: String) {
+    PTT("Dedicated PTT"),
+    VIDEO("Video key"),
+    CAMERA("Camera key"),
+    HEADSET("Headset hook"),
+    STEM("Stem key"),
+    F1("F1"),
+    F2("F2"),
+    F3("F3"),
+    F4("F4"),
+    GAME_L1("Game L1"),
+    GAME_R1("Game R1"),
+    VOLUME_UP("Volume up"),
+    VOLUME_DOWN("Volume down")
+}
+
+enum class HardwareButtonAction(
+    val title: String,
+    val momentary: Boolean,
+    val description: String
+) {
+    DEFAULT("Default", true, "Use OpenRadio's built-in behavior for this button."),
+    DISABLED("Disabled", true, "Ignore the button in OpenRadio."),
+    CONTEXT_PTT("Context PTT", true, "Hold PTT for the current mode: ROIP, hotspot, or RF."),
+    NETWORK_PTT("ROIP PTT", true, "Hold PTT on the active network session."),
+    RADIO_PTT("RF PTT", true, "Hold PTT on the CJ-1 RF side."),
+    HOTSPOT_PTT("Hotspot PTT", true, "Hold the hotspot bridge PTT."),
+    TOGGLE_NETWORK_PTT("Toggle ROIP PTT", false, "Press once to key ROIP, press again to release."),
+    TOGGLE_RADIO_PTT("Toggle RF PTT", false, "Press once to key RF, press again to release."),
+    CONNECT_ROIP("Connect ROIP", false, "Connect the selected ROIP provider."),
+    DISCONNECT_ROIP("Disconnect ROIP", false, "Drop the active ROIP session."),
+    NEXT_MODE("Next mode", false, "Cycle to the next app mode."),
+    PREVIOUS_MODE("Previous mode", false, "Cycle to the previous app mode."),
+    NEXT_MEMORY("Next memory", false, "Load the next saved memory."),
+    PREVIOUS_MEMORY("Previous memory", false, "Load the previous saved memory."),
+    TUNE_UP("Tune up", false, "Step frequency upward."),
+    TUNE_DOWN("Tune down", false, "Step frequency downward."),
+    VOLUME_UP("Volume up", false, "Raise Android media volume."),
+    VOLUME_DOWN("Volume down", false, "Lower Android media volume."),
+    KNOB_UP("Knob up", false, "Send one clockwise knob step."),
+    KNOB_DOWN("Knob down", false, "Send one counter-clockwise knob step.")
+}
+
 enum class ComjotMode(
     val title: String,
     val subtitle: String,
@@ -180,10 +223,10 @@ enum class ProviderType(
         subtitle = "Node-to-node style linking over data",
         stationIdLabel = "Local Node",
         targetLabel = "Remote Node",
-        defaultHost = "allstar.example.net",
+        defaultHost = "",
         defaultPort = 4569,
         defaultTarget = "",
-        helperText = "Use your IAX username/secret, call the local node on your server, and optionally auto-link a remote node."
+        helperText = "Use your AllStar node number and node password. Leave server blank to resolve the remote node directly."
     )
 }
 
@@ -209,7 +252,7 @@ data class ProviderProfile(
                 target = type.defaultTarget,
                 serverHost = type.defaultHost,
                 serverPort = type.defaultPort.toString(),
-                timeSlot = if (type == ProviderType.ALLSTAR) "iaxrpt" else "2",
+                timeSlot = if (type == ProviderType.ALLSTAR) "" else "2",
                 password = "",
                 apiKey = ""
             )
@@ -259,6 +302,21 @@ data class SessionSnapshot(
     val audioDecoderState: String? = null
 )
 
+data class CallerLookup(
+    val callsign: String,
+    val source: String = "OpenCallbook",
+    val name: String? = null,
+    val location: String? = null,
+    val status: String? = null,
+    val licenseClass: String? = null,
+    val expires: String? = null,
+    val fccUrl: String? = null,
+    val qrzUrl: String? = null,
+    val qthUrl: String? = null,
+    val loading: Boolean = false,
+    val error: String? = null
+)
+
 data class HotspotProfile(
     val latitude: String = "0.000000",
     val longitude: String = "0.000000",
@@ -301,7 +359,7 @@ data class ComjotProfile(
     val txToneCode: String = "None",
     val rfPower: ComjotRfPower = ComjotRfPower.HIGH,
     val volume: String = "6",
-    val micGain: String = "0",
+    val micGain: String = "3",
     val repeaterDecoupling: Boolean = false,
     val baudRate: String = "57600"
 ) {
@@ -547,12 +605,16 @@ data class AppUiState(
     val memories: List<RadioMemory> = emptyList(),
     val selectedMemoryId: String? = null,
     val knobControlMode: KnobControlMode = KnobControlMode.VOLUME,
+    val hardwareButtonMappings: Map<HardwareButtonInput, HardwareButtonAction> = emptyMap(),
     val accentColor: AccentColor = AccentColor.GREEN,
     val roipOperationMode: RoipOperationMode = RoipOperationMode.DIRECT,
     val selectedRoipProviderId: String? = null,
     val radioHardwareAvailable: Boolean = true,
     val comjot: ComjotUiState = ComjotUiState(),
     val activeSession: SessionSnapshot? = null,
+    val callerLookup: CallerLookup? = null,
+    val updateInProgress: Boolean = false,
+    val updateStatus: String? = null,
     val isBusy: Boolean = false,
     val errorMessage: String? = null,
     val lastSyncLabel: String? = null
